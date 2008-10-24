@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# radsecproxy	radsecproxy (secure radius proxy daemon)
+#
+# chkconfig:	345 89 11
+#
+# description:	radsecproxy is a generic RADIUS proxy that in addition to to usual \
+#		RADIUS UDP transport, also supports TLS (RadSec). The aim is for the \
+#		proxy to have sufficient features to be flexible, while at the same \
+#		time to be small, efficient and easy to configure. Currently the \
+#		executable on Linux is only about 48 Kb, and it uses about 64 Kb \
+#		(depending on the number of peers) while running. \
+
+
+# Source function library
+. /etc/rc.d/init.d/functions
+
+# Get network config
+. /etc/sysconfig/network
+
+# Get service config
+[ -f /etc/sysconfig/radsecproxy ] && . /etc/sysconfig/radsecproxy
+
+# Check that networking is up.
+if is_yes "${NETWORKING}"; then
+	if [ ! -f /var/lock/subsys/network -a "$1" != stop -a "$1" != status ]; then
+		msg_network_down radsecproxy
+		exit 1
+	fi
+else
+	exit 0
+fi
+
+checkconfig() {
+	/usr/sbin/radsecproxy -p || exit 1
+}
+
+start() {
+	checkconfig
+	# Check if the service is already running?
+	if [ ! -f /var/lock/subsys/radsecproxy ]; then
+		msg_starting radsecproxy
+		daemon --pidfile /var/run/radsecproxy.pid /usr/sbin/radsecproxy
+		RETVAL=$?
+		[ $RETVAL -eq 0 ] && touch /var/lock/subsys/radsecproxy
+	else
+		msg_already_running radsecproxy
+	fi
+}
+
+stop() {
+	if [ -f /var/lock/subsys/radsecproxy ]; then
+		msg_stopping radsecproxy
+		killproc --pidfile /var/run/radsecproxy.pid radsecproxy
+		rm -f /var/lock/subsys/radsecproxy >/dev/null 2>&1
+	else
+		msg_not_running radsecproxy
+	fi
+}
+
+RETVAL=0
+# See how we were called.
+case "$1" in
+  start)
+  	start
+	;;
+  stop)
+  	stop
+	;;
+  restart)
+	checkconfig
+	stop
+	start
+	;;
+  status)
+	status radsecproxy
+	exit $?
+	;;
+  reload|force-reload)
+	if [ -f /var/lock/subsys/radsecproxy ]; then
+		checkconfig
+		msg_reloading radsecproxy
+		killproc radsecproxy -HUP
+		RETVAL=$?
+	else
+		msg_not_running radsecproxy
+		exit 7
+	fi
+	;;
+  *)
+	msg_usage "$0 {start|stop|restart|reload|force-reload|status}"
+	exit 3
+esac
+
+exit $RETVAL
