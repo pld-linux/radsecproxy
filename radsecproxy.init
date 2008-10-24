@@ -11,7 +11,6 @@
 #		executable on Linux is only about 48 Kb, and it uses about 64 Kb \
 #		(depending on the number of peers) while running. \
 
-
 # Source function library
 . /etc/rc.d/init.d/functions
 
@@ -58,23 +57,33 @@ stop() {
 	fi
 }
 
+condrestart() {
+	if [ -f /var/lock/subsys/cpqarrayd ]; then
+		checkconfig
+		stop
+		start
+	else
+		msg_not_running cpqarrayd
+		RETVAL=$1
+	fi
+}
+
 RETVAL=0
 # See how we were called.
 case "$1" in
   start)
-  	start
+	start
 	;;
   stop)
-  	stop
+	stop
 	;;
   restart)
 	checkconfig
 	stop
 	start
 	;;
-  status)
-	status radsecproxy
-	exit $?
+  try-restart)
+	condrestart 0
 	;;
   reload|force-reload)
 	if [ -f /var/lock/subsys/radsecproxy ]; then
@@ -87,8 +96,12 @@ case "$1" in
 		exit 7
 	fi
 	;;
+  status)
+	status radsecproxy
+	exit $?
+	;;
   *)
-	msg_usage "$0 {start|stop|restart|reload|force-reload|status}"
+	msg_usage "$0 {start|stop|restart|try-restart|reload|force-reload|status}"
 	exit 3
 esac
 
