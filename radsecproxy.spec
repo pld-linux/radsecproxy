@@ -1,13 +1,14 @@
 # TODO:
 # - own UID/GID
+# - logrotate file
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
-Version:	1.2
-Release:	0.3
+Version:	1.3
+Release:	0.1
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
-# Source0-md5:	e209054731b3316301d0920c15a0a5b2
+# Source0-md5:	a352ae4efeeed0528cee8efa21f460b6
 Source1:	%{name}.init
 URL:		http://software.uninett.no/radsecproxy/
 BuildRequires:	openssl-devel
@@ -25,10 +26,7 @@ executable on Linux is only about 48 Kb, and it uses about 64 Kb
 %setup -q
 
 %build
-%configure \
-	--enable-shadow \
-	--with-secure-path \
-
+%configure
 %{__make}
 
 %install
