@@ -1,0 +1,6 @@
+/var/log/radsecproxy.log {
+	missingok
+	postrotate
+		/sbin/service radsecproxy reload > /dev/null
+	endscript
+}

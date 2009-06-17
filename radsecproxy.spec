@@ -1,6 +1,3 @@
-# TODO:
-# - own UID/GID
-# - logrotate file
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
 Version:	1.3
@@ -10,6 +7,7 @@ Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
 # Source0-md5:	a352ae4efeeed0528cee8efa21f460b6
 Source1:	%{name}.init
+Source2:	%{name}.logrotate
 Patch0:		%{name}-logformat.patch
 URL:		http://software.uninett.no/radsecproxy/
 BuildRequires:	openssl-devel
@@ -34,7 +32,7 @@ executable on Linux is only about 48 Kb, and it uses about 64 Kb
 %install
 rm -rf $RPM_BUILD_ROOT
 install -d $RPM_BUILD_ROOT%{_sysconfdir}/radsecproxy.conf.d \
-	$RPM_BUILD_ROOT/etc/{rc.d/init.d,sysconfig}
+	$RPM_BUILD_ROOT/etc/{rc.d/init.d,sysconfig,logrotate.d}
 
 %{__make} install \
 	DESTDIR=$RPM_BUILD_ROOT
@@ -43,6 +41,7 @@ mv $RPM_BUILD_ROOT%{_sysconfdir}/radsecproxy.conf-example \
 	$RPM_BUILD_ROOT%{_sysconfdir}/radsecproxy.conf
 
 install %{SOURCE1} $RPM_BUILD_ROOT/etc/rc.d/init.d/%{name}
+install %{SOURCE2} $RPM_BUILD_ROOT/etc/logrotate.d/%{name}
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -61,6 +60,7 @@ fi
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog README
 %attr(640,root,root) %config(noreplace,missingok) %verify(not md5 mtime size) %{_sysconfdir}/radsecproxy.conf
+%attr(640,root,root) %config(noreplace,missingok) %verify(not md5 mtime size) /etc/logrotate.d/radsecproxy.conf
 %attr(750,root,root) %dir %{_sysconfdir}/radsecproxy.conf.d
 %attr(755,root,root) %{_sbindir}/radsecproxy
 %attr(754,root,root) /etc/rc.d/init.d/%{name}
