@@ -58,12 +58,12 @@ stop() {
 }
 
 condrestart() {
-	if [ -f /var/lock/subsys/cpqarrayd ]; then
+	if [ -f /var/lock/subsys/radsecproxy ]; then
 		checkconfig
 		stop
 		start
 	else
-		msg_not_running cpqarrayd
+		msg_not_running radsecproxy
 		RETVAL=$1
 	fi
 }
