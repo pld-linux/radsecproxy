@@ -3,19 +3,19 @@
 # - docbook2x is required for manual build
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
-Version:	1.4.1
+Version:	1.4.2
 Release:	1
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
-# Source0-md5:	fd8eaba57dbf4c43cf41d8dfeafab0d7
+# Source0-md5:	ccdff609c72c0862235b9119323345a8
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
 URL:		http://software.uninett.no/radsecproxy/
 #For manual creation:
 #BuildRequires:	docbook2x-to-man
-BuildRequires:	openssl-devel >= 1.0.0b
+Requires:	openssl >= 1.0.0b
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %description
