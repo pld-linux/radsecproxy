@@ -13,9 +13,11 @@ Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
 URL:		http://software.uninett.no/radsecproxy/
-#For manual creation:
+# For manual creation:
 #BuildRequires:	docbook2x-to-man
 Requires:	openssl >= 1.0.0b
+Requires(post,preun):	/sbin/chkconfig
+Requires:	rc-scripts >= 0.4.3.0
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %description
@@ -54,11 +56,11 @@ install -d $RPM_BUILD_ROOT%{_sysconfdir}/radsecproxy.conf.d \
 %{__make} install \
 	DESTDIR=$RPM_BUILD_ROOT
 
-install radsecproxy.conf-example $RPM_BUILD_ROOT%{_sysconfdir}/%{name}.conf
+cp -p radsecproxy.conf-example $RPM_BUILD_ROOT%{_sysconfdir}/%{name}.conf
 
-install %{SOURCE1} $RPM_BUILD_ROOT/etc/rc.d/init.d/%{name}
-install %{SOURCE2} $RPM_BUILD_ROOT/etc/logrotate.d/%{name}
-install %{SOURCE3} $RPM_BUILD_ROOT/etc/init/%{name}.conf
+install -p %{SOURCE1} $RPM_BUILD_ROOT/etc/rc.d/init.d/%{name}
+cp -p %{SOURCE2} $RPM_BUILD_ROOT/etc/logrotate.d/%{name}
+cp -p %{SOURCE3} $RPM_BUILD_ROOT/etc/init/%{name}.conf
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -69,8 +71,8 @@ rm -rf $RPM_BUILD_ROOT
 
 %preun
 if [ "$1" = "0" ]; then
-        %service %{name} stop
-        /sbin/chkconfig --del %{name}
+	%service %{name} stop
+	/sbin/chkconfig --del %{name}
 fi
 
 %post upstart
