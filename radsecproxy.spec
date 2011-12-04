@@ -3,12 +3,12 @@
 # - docbook2x is required for manual build
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
-Version:	1.4.2
+Version:	1.5
 Release:	1
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
-# Source0-md5:	ccdff609c72c0862235b9119323345a8
+# Source0-md5:	c65742a1b471c572ca7f6d11000d41f5
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
@@ -62,6 +62,8 @@ install -p %{SOURCE1} $RPM_BUILD_ROOT/etc/rc.d/init.d/%{name}
 cp -p %{SOURCE2} $RPM_BUILD_ROOT/etc/logrotate.d/%{name}
 cp -p %{SOURCE3} $RPM_BUILD_ROOT/etc/init/%{name}.conf
 
+install -p radsecproxy.conf.5 $RPM_BUILD_ROOT/%{_mandir}/man5
+
 %clean
 rm -rf $RPM_BUILD_ROOT
 
@@ -88,11 +90,10 @@ fi
 %attr(640,root,root) %config(noreplace,missingok) %verify(not md5 mtime size) /etc/logrotate.d/%{name}
 %attr(750,root,root) %dir %{_sysconfdir}/radsecproxy.conf.d
 %attr(755,root,root) %{_sbindir}/radsecproxy
-%attr(755,root,root) %{_bindir}/catgconf
+%attr(755,root,root) %{_bindir}/radsecproxy-conf
 %attr(754,root,root) /etc/rc.d/init.d/%{name}
 %{_mandir}/man1/*
-# With manual created:
-#%{_mandir}/man5/*
+%{_mandir}/man5/*
 
 %files upstart
 %defattr(644,root,root,755)
