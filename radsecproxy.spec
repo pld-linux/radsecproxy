@@ -1,10 +1,7 @@
-####
-# TODO:
-# - docbook2x is required for manual build
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
 Version:	1.5
-Release:	1
+Release:	1.5
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
@@ -12,9 +9,10 @@ Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
+Patch0:		%{name}-docbook2x.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
-#BuildRequires:	docbook2x-to-man
+BuildRequires:	docbook2X
 Requires:	openssl >= 1.0.0b
 Requires(post,preun):	/sbin/chkconfig
 Requires:	rc-scripts >= 0.4.3.0
@@ -43,8 +41,11 @@ Opis zadania Upstart dla %{name}.
 
 %prep
 %setup -q
+%patch0 -p1
 
 %build
+%{__aclocal}
+%{__autoconf}
 %configure
 %{__make}
 

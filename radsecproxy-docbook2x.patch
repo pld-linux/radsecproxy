@@ -1,0 +1,13 @@
+--- ./configure.ac.org	2011-10-08 16:07:29.000000000 +0200
++++ ./configure.ac	2011-12-20 12:15:02.046440193 +0100
+@@ -101,8 +101,8 @@ if test "x$dtls" = "xyes" ; then
+   TARGET_CFLAGS="$TARGET_CFLAGS -DRADPROT_DTLS"
+ fi
+  
+-AC_ARG_VAR([DOCBOOK2X_MAN], [docbook2x-man])
+-AC_CHECK_PROG([DOCBOOK2X_MAN], [docbook2x-man], [yes])
++AC_ARG_VAR([DOCBOOK2X_MAN], [docbook2X2man])
++AC_CHECK_PROG([DOCBOOK2X_MAN], [docbook2X2man], [yes])
+ AM_CONDITIONAL(HAVE_DOCBOOK2X_MAN, test "$DOCBOOK2X_MAN" = "yes")
+ 
+ AC_SUBST(TARGET_CFLAGS)
