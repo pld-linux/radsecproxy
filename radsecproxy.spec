@@ -18,6 +18,7 @@ Patch2:		%{name}-visinst.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
 BuildRequires:	docbook2X
+BuildRequires:	nettle-devel
 Requires:	openssl >= 1.0.0b
 Requires(post,preun):	/sbin/chkconfig
 Requires:	rc-scripts >= 0.4.3.0

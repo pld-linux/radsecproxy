@@ -36,3 +36,40 @@
      }
  
      memset(macout, 0, sizeof(macout));
+--- ./radsecproxy.conf-example.org	2011-12-20 12:46:01.682320839 +0100
++++ ./radsecproxy.conf-example	2011-12-20 16:32:38.963596053 +0100
+@@ -36,7 +36,7 @@
+ #   Full  -- Do log in F-Ticks format and do log VISINST.
+ # Please note that in order to get F-Ticks logging for a given client,
+ # its matching client configuration block has to contain the
+-# fticksVISCOUNTRY option.
++# fticksVISCOUNTRY option and it can contain the fticksVISINST option.
+ 
+ # You can optionally specify FTicksMAC in order to determine if and
+ # how Calling-Station-Id (users Ethernet MAC address) is being logged.
+--- ./radsecproxy.conf.5.xml.org	2011-12-20 16:26:32.610010659 +0100
++++ ./radsecproxy.conf.5.xml	2011-12-20 16:32:01.411861864 +0100
+@@ -479,9 +479,9 @@ blocktype name {
+       <literal>certificateNameCheck</literal>,
+       <literal>matchCertificateAttribute</literal>,
+       <literal>duplicateInterval</literal>, <literal>AddTTL</literal>,
+-      <literal>fticksVISCOUNTRY</literal>, <literal>rewrite</literal>,
+-      <literal>rewriteIn</literal>, <literal>rewriteOut</literal>, and
+-      <literal>rewriteAttribute</literal>.
++      <literal>fticksVISCOUNTRY</literal>, <literal>fticksVISINST</literal>,
++      <literal>rewrite</literal>, <literal>rewriteIn</literal>,
++      <literal>rewriteOut</literal>, and <literal>rewriteAttribute</literal>.
+ 
+       We already discussed the <literal>host</literal> option. The
+       value of <literal>type</literal> must be one of
+@@ -543,6 +543,10 @@ blocktype name {
+       <literal>FTicksReporting</literal> basic option.
+     </para>
+     <para>
++      The <literal>fticksVISINST</literal> option overwrites 
++      <literal>VISINST</literal> value.
++    </para>
++    <para>
+       The <literal>rewrite</literal> option is deprecated. Use
+       <literal>rewriteIn</literal> instead.
+     </para>
