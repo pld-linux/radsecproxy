@@ -12,6 +12,7 @@ Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
 Patch0:		%{name}-docbook2x.patch
+## will be included in 1.6
 Patch1:		%{name}-fticks.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
