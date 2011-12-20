@@ -11,3 +11,14 @@
  AM_CONDITIONAL(HAVE_DOCBOOK2X_MAN, test "$DOCBOOK2X_MAN" = "yes")
  
  AC_SUBST(TARGET_CFLAGS)
+--- ./Makefile.am.org	2011-10-08 15:33:24.000000000 +0200
++++ ./Makefile.am	2011-12-20 12:31:21.988362106 +0100
+@@ -65,7 +65,7 @@ endif
+ 
+ ####################
+ radsecproxy.conf.5: $(srcdir)/radsecproxy.conf.5.xml
+-	docbook2x-man $<
++	docbook2X2man $<
+ 
+ # Build HTML version of radsecproxy.conf.5.  NOTE: Only tested with
+ # 'openjade' package installed on Ubuntu 9.10.

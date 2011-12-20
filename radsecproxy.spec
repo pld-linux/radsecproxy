@@ -1,7 +1,7 @@
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
 Version:	1.5
-Release:	1.5
+Release:	1.9
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
@@ -10,6 +10,7 @@ Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
 Patch0:		%{name}-docbook2x.patch
+Patch1:		%{name}-fticks.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
 BuildRequires:	docbook2X
@@ -42,12 +43,18 @@ Opis zadania Upstart dla %{name}.
 %prep
 %setup -q
 %patch0 -p1
+%patch1 -p1
 
 %build
 %{__aclocal}
 %{__autoconf}
-%configure
+%configure \
+	--enable-fticks
+# Some trash comes with tar:
+%{__make} clean
 %{__make}
+# FIXME:
+mv ______radsecproxy.conf\ ____.5 radsecproxy.conf.5
 
 %install
 rm -rf $RPM_BUILD_ROOT
@@ -92,6 +99,7 @@ fi
 %attr(750,root,root) %dir %{_sysconfdir}/radsecproxy.conf.d
 %attr(755,root,root) %{_sbindir}/radsecproxy
 %attr(755,root,root) %{_bindir}/radsecproxy-conf
+%attr(755,root,root) %{_bindir}/radsecproxy-hash
 %attr(754,root,root) /etc/rc.d/init.d/%{name}
 %{_mandir}/man1/*
 %{_mandir}/man5/*
