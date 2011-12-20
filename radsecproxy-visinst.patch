@@ -1,0 +1,38 @@
+--- ./radsecproxy.c.org	2011-12-20 12:46:01.678987351 +0100
++++ ./radsecproxy.c	2011-12-20 15:44:24.186577784 +0100
+@@ -2690,6 +2690,7 @@ int confclient_cb(struct gconffile **cf,
+ 	    "rewriteattribute", CONF_STR, &conf->confrewriteusername,
+ #if defined(WANT_FTICKS)
+ 	    "fticksVISCOUNTRY", CONF_STR, &conf->fticks_viscountry,
++	    "fticksVISINST", CONF_STR, &conf->fticks_visinst,
+ #endif
+ 	    NULL
+ 	    ))
+--- ./radsecproxy.h.org	2011-12-20 12:46:01.685654326 +0100
++++ ./radsecproxy.h	2011-12-20 15:43:05.166261843 +0100
+@@ -131,6 +131,7 @@ struct clsrvconf {
+     struct list *clients;
+     struct server *servers;
+     char *fticks_viscountry;
++    char *fticks_visinst;
+ };
+ 
+ #include "tlscommon.h"
+--- ./fticks.c.org	2011-12-20 12:46:01.678987351 +0100
++++ ./fticks.c	2011-12-20 15:51:30.612937428 +0100
+@@ -107,8 +107,13 @@ fticks_log(const struct options *options
+ 
+     memset(visinst, 0, sizeof(visinst));
+     if (options->fticks_reporting == RSP_FTICKS_REPORTING_FULL) {
+-	snprintf((char *) visinst, sizeof(visinst), "VISINST=%s#",
+-		 client->conf->name);
++	    if (client->conf->fticks_visinst != NULL ) {
++		    snprintf((char *) visinst, sizeof(visinst), "VISINST=%s#",
++				    client->conf->fticks_visinst);
++	    } else {
++		    snprintf((char *) visinst, sizeof(visinst), "VISINST=%s#",
++				    client->conf->name);
++	    }
+     }
+ 
+     memset(macout, 0, sizeof(macout));

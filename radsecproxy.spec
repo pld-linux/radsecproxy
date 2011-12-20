@@ -3,7 +3,7 @@
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
 Version:	1.5
-Release:	2
+Release:	3
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.gz
@@ -14,6 +14,7 @@ Source3:	%{name}.upstart
 Patch0:		%{name}-docbook2x.patch
 ## will be included in 1.6
 Patch1:		%{name}-fticks.patch
+Patch2:		%{name}-visinst.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
 BuildRequires:	docbook2X
@@ -47,6 +48,7 @@ Opis zadania Upstart dla %{name}.
 %setup -q
 %patch0 -p1
 %patch1 -p1
+%patch2 -p1
 
 %build
 %{__aclocal}
