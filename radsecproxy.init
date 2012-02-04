@@ -41,7 +41,7 @@ start() {
 	# Check if the service is already running?
 	if [ ! -f /var/lock/subsys/radsecproxy ]; then
 		msg_starting radsecproxy
-		daemon --pidfile /var/run/radsecproxy.pid /usr/sbin/radsecproxy
+		daemon /usr/sbin/radsecproxy -i /var/run/radsecproxy.pid
 		RETVAL=$?
 		[ $RETVAL -eq 0 ] && touch /var/lock/subsys/radsecproxy
 	else
