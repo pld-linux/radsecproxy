@@ -12,9 +12,6 @@ Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Source3:	%{name}.upstart
 Patch0:		%{name}-docbook2x.patch
-## will be included in 1.6
-Patch1:		%{name}-fticks.patch
-Patch2:		%{name}-visinst.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
 BuildRequires:	docbook2X
@@ -48,8 +45,6 @@ Opis zadania Upstart dla %{name}.
 %prep
 %setup -q
 %patch0 -p1
-#patch1 -p1
-#patch2 -p1
 
 %build
 %{__aclocal}
