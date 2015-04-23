@@ -1,9 +1,0 @@
-description "RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)"
-
-start on pld.sysinit-done
-stop on pld.shutdown-started
-
-respawn
-exec /usr/sbin/radsecproxy -i /var/run/radsecproxy.pid
-expect daemon
-
