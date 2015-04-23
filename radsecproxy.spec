@@ -13,6 +13,8 @@ Source2:	%{name}.logrotate
 Patch0:		%{name}-docbook2x.patch
 URL:		http://software.uninett.no/radsecproxy/
 # For manual creation:
+BuildRequires:	autoconf
+BuildRequires:	automake
 BuildRequires:	docbook2X
 BuildRequires:	nettle-devel
 Requires:	openssl >= 1.0.0b
@@ -48,6 +50,7 @@ Opis zadania Upstart dla %{name}.
 %build
 %{__aclocal}
 %{__autoconf}
+%{__automake}
 %configure \
 	--enable-fticks
 # Some trash comes with tar:
