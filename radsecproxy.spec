@@ -2,12 +2,12 @@
 # - own UID/GID
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
-Version:	1.6.7
+Version:	1.6.8
 Release:	1
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	http://software.uninett.no/radsecproxy/%{name}-%{version}.tar.xz
-# Source0-md5:	d76cf4fc68515667b8c67387f5045150
+# Source0-md5:	36872d5411438fbc0da58e2f1fbbf180
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
 Patch0:		%{name}-docbook2x.patch
