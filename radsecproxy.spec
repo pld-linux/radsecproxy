@@ -3,7 +3,7 @@
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
 Name:		radsecproxy
 Version:	1.7.1
-Release:	2
+Release:	3
 License:	GPLv2+ or BSD-like
 Group:		Networking/Daemons/Radius
 Source0:	https://github.com/radsecproxy/radsecproxy/releases/download/%{version}/%{name}-%{version}.tar.gz
