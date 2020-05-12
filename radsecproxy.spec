@@ -1,25 +1,25 @@
 # TODO:
 # - own UID/GID
 Summary:	RADIUS proxy that in addition to to usual RADIUS UDP transport, also supports TLS (RadSec)
+Summary(pl.UTF-8):	Proxy RADIUS, poza zwyczajowym transportem UDP, obsługujące także TLS (RadSec)
 Name:		radsecproxy
-Version:	1.7.1
-Release:	3
-License:	GPLv2+ or BSD-like
+Version:	1.8.1
+Release:	1
+License:	BSD
 Group:		Networking/Daemons/Radius
+#Source0Download: https://github.com/radsecproxy/radsecproxy/releases
 Source0:	https://github.com/radsecproxy/radsecproxy/releases/download/%{version}/%{name}-%{version}.tar.gz
-# Source0-md5:	070ec707aa2f351bdc5387b474b58e7a
+# Source0-md5:	500643689d9ea37f90fe1dd51f394c6b
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
-Patch0:		%{name}-paths.patch
-URL:		http://software.uninett.no/radsecproxy/
-# For manual creation:
-BuildRequires:	autoconf
+URL:		https://github.com/radsecproxy/radsecproxy
+BuildRequires:	autoconf >= 2.50
 BuildRequires:	automake
-BuildRequires:	docbook2X
 BuildRequires:	nettle-devel
-Requires:	openssl >= 1.0.0b
 Requires(post,preun):	/sbin/chkconfig
+Requires:	openssl >= 1.0.0b
 Requires:	rc-scripts >= 0.4.3.0
+Obsoletes:	radsecproxy-upstart
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %description
@@ -27,34 +27,28 @@ radsecproxy is a generic RADIUS proxy that in addition to to usual
 RADIUS UDP transport, also supports TLS (RadSec). The aim is for the
 proxy to have sufficient features to be flexible, while at the same
 time to be small, efficient and easy to configure. Currently the
-executable on Linux is only about 48 Kb, and it uses about 64 Kb
+executable on Linux is only about 48 kB, and it uses about 64 kB
 (depending on the number of peers) while running.
 
-%package upstart
-Summary:	Upstart job description for %{name}
-Summary(pl.UTF-8):	Opis zadania Upstart dla %{name}
-Group:		Daemons
-Requires:	%{name} = %{version}-%{release}
-Requires:	upstart >= 0.6
-
-%description upstart
-Upstart job description for %{name}.
-
-%description upstart -l pl.UTF-8
-Opis zadania Upstart dla %{name}.
+%description -l pl.UTF-8
+radsecproxy to ogólne proxy RADIUS, które, poza zwyczajowym
+transportem UDP RADIUS, obsługuje także TLS (RadSec). Celem projektu
+jest dostarczenie wystarczająco dużej funkcjonalności, aby było
+elastyczne, a jednocześnie małe, wydajne i łatwe do skonfigurowania.
+Obecnie rozmiar binarki pod Linuksem to tylko około 48 kB, a w czasie
+działania zużywa około 64 kB (w zależności od liczby partnerów).
 
 %prep
 %setup -q
-%patch0 -p1
+
+%{__rm} -r autom4te.cache
 
 %build
 %{__aclocal}
 %{__autoconf}
 %{__automake}
-%configure \
-	--enable-fticks
-# Some trash comes with tar:
-%{__make} clean
+%configure
+
 %{__make}
 
 %install
@@ -87,7 +81,7 @@ fi
 
 %files
 %defattr(644,root,root,755)
-%doc AUTHORS ChangeLog README
+%doc AUTHORS ChangeLog LICENSE README THANKS
 %attr(640,root,root) %config(noreplace,missingok) %verify(not md5 mtime size) %{_sysconfdir}/radsecproxy.conf
 %attr(640,root,root) %config(noreplace,missingok) %verify(not md5 mtime size) /etc/logrotate.d/%{name}
 %attr(750,root,root) %dir %{_sysconfdir}/radsecproxy.conf.d
@@ -95,5 +89,6 @@ fi
 %attr(755,root,root) %{_bindir}/radsecproxy-conf
 %attr(755,root,root) %{_bindir}/radsecproxy-hash
 %attr(754,root,root) /etc/rc.d/init.d/%{name}
-%{_mandir}/man1/*
-%{_mandir}/man5/*
+%{_mandir}/man1/radsecproxy.1*
+%{_mandir}/man1/radsecproxy-hash.1*
+%{_mandir}/man5/radsecproxy.conf.5*
