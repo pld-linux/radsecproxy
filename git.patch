@@ -1,0 +1,2058 @@
+diff --git a/ChangeLog b/ChangeLog
+index c1943fb..d6552db 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,20 @@
++unreleased changes
++	New features:
++	- Optionally log accounting requests when respoinding directly (#72)
++	- SNI support for outgoing connections (#90)
++
++	Misc:
++	- Don't require server type to be set by dyndisc scripts
++	- OpenSSL 3.0 compatibility (#70)
++	
++	Bug Fixes:
++	- Fix refused startup with openssl <1.1 (#82)
++	- Fix compiler issue for Fedora 33 on s390x (#84)
++	- Fix small memory leak in config parser
++	- Fix lazy certificate check when connecting to TLS servers
++	- Fix connect is aborted if first host in list has invalid certificate
++	- Fix setstacksize for glibc 2.34 (#91)
++
+ 2021-05-28 1.9.0
+ 	New features:
+ 	- Accept multiple source* configs for IPv4/v6
+diff --git a/README b/README
+index 20700fa..5074c77 100644
+--- a/README
++++ b/README
+@@ -8,11 +8,12 @@ flexible, while at the same time to be small, efficient and easy to configure.
+ Official packages are available:
+ 
+ Debian: apt-get install radsecproxy
++CentOS/RHEL/Rocky: yum install epel-release; yum install radsecproxy
+ Fedora: dnf install radsecproxy
+ FreeBSD: pkg install radsecproxy
+ NetBSD: pkgin install radsecproxy
+ 
+-Or built it from this rouce on most Unix like systems by simply typing
++Or built it from this source on most Unix like systems by simply typing
+ 
+     ./configure && make
+ 
+diff --git a/configure.ac b/configure.ac
+index 630fcac..d486e47 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -11,6 +11,12 @@ AC_PROG_RANLIB
+ AC_CHECK_FUNCS([mallopt])
+ AC_REQUIRE_AUX_FILE([tap-driver.sh])
+ 
++m4_version_prereq(2.70, [], [AC_PROG_CC_C99])
++if test "$ac_cv_prog_cc_c99" = "no"; then
++  echo "requires C99 compatible compiler"
++  exit -1
++fi
++
+ udp=yes
+ AC_ARG_ENABLE(udp,
+   [  --enable-udp whether to enable UDP transport: yes/no; default yes ],
+diff --git a/dtls.c b/dtls.c
+index 09aa9ee..15835d6 100644
+--- a/dtls.c
++++ b/dtls.c
+@@ -142,6 +142,7 @@ int dtlsread(SSL *ssl, unsigned char *buf, int num, int timeout, pthread_mutex_t
+                     continue;
+                 case SSL_ERROR_ZERO_RETURN:
+                     debug(DBG_DBG, "dtlsread: got ssl shutdown");
++                    /* fallthrough */
+                 default:
+                     while ((error = ERR_get_error()))
+                         debug(DBG_ERR, "dtlsread: SSL: %s", ERR_error_string(error, NULL));
+@@ -305,10 +306,11 @@ void *dtlsservernew(void *arg) {
+     struct timeval timeout;
+     struct addrinfo tmpsrvaddr;
+     char tmp[INET6_ADDRSTRLEN], *subj;
++    struct hostportres *hp;
+ 
+     debug(DBG_WARN, "dtlsservernew: incoming DTLS connection from %s", addr2string((struct sockaddr *)&params->addr, tmp, sizeof(tmp)));
+ 
+-    conf = find_clconf(handle, (struct sockaddr *)&params->addr, NULL);
++    conf = find_clconf(handle, (struct sockaddr *)&params->addr, NULL, &hp);
+     if (!conf)
+         goto exit;
+ 
+@@ -342,7 +344,7 @@ void *dtlsservernew(void *arg) {
+     accepted_tls = conf->tlsconf;
+ 
+     while (conf) {
+-        if (accepted_tls == conf->tlsconf && verifyconfcert(cert, conf)) {
++        if (accepted_tls == conf->tlsconf && verifyconfcert(cert, conf, NULL)) {
+             subj = getcertsubject(cert);
+             if(subj) {
+                 debug(DBG_WARN, "dtlsservernew: DTLS connection from %s, client %s, subject %s up",
+@@ -362,9 +364,10 @@ void *dtlsservernew(void *arg) {
+             }
+             goto exit;
+         }
+-        conf = find_clconf(handle, (struct sockaddr *)&params->addr, &cur);
++        conf = find_clconf(handle, (struct sockaddr *)&params->addr, &cur, &hp);
+     }
+-    debug(DBG_WARN, "dtlsservernew: ignoring request, no matching TLS client");
++    debug(DBG_WARN, "dtlsservernew: ignoring request, no matching TLS client for %s", 
++        addr2string((struct sockaddr *)&params->addr, tmp, sizeof(tmp)));
+ 
+     if (cert)
+     X509_free(cert);
+@@ -467,7 +470,7 @@ void *dtlslistener(void *arg) {
+             continue;
+         }
+ 
+-        conf = find_clconf(handle, (struct sockaddr *)&from, NULL);
++        conf = find_clconf(handle, (struct sockaddr *)&from, NULL, NULL);
+         if (!conf) {
+             debug(DBG_INFO, "dtlslistener: got UDP from unknown peer %s, ignoring", addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));
+             if (recv(s, buf, 4, 0) == -1)
+@@ -486,6 +489,7 @@ void *dtlslistener(void *arg) {
+             ssl = SSL_new(ctx);
+             if (!ssl) {
+                 pthread_mutex_unlock(&conf->tlsconf->lock);
++                debug(DBG_ERR, "dtlslistener: failed to create SSL connection");
+                 continue;
+             }
+             bio = BIO_new_dgram(s, BIO_NOCLOSE);
+@@ -514,12 +518,28 @@ void *dtlslistener(void *arg) {
+             } else {
+                 free(params);
+             }
++        } else {
++            unsigned long error;
++            while ((error = ERR_get_error()))
++                debug(DBG_ERR, "dtlslistener: DTLS_listen failed: %s", ERR_error_string(error, NULL));
++            debug(DBG_ERR, "dtlslistener: DTLS_listen failed from %s", addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));
+         }
+         pthread_mutex_unlock(&conf->tlsconf->lock);
+     }
+     return NULL;
+ }
+ 
++static void cleanup_connection(struct server *server) {
++    if (server->ssl)
++        SSL_shutdown(server->ssl);
++    if (server->sock >= 0)
++        close(server->sock);
++    server->sock = -1;
++    if (server->ssl)
++        SSL_free(server->ssl);
++    server->ssl = NULL;
++}
++
+ int dtlsconnect(struct server *server, int timeout, char *text) {
+     struct timeval socktimeout, now, start;
+     time_t wait;
+@@ -531,6 +551,7 @@ int dtlsconnect(struct server *server, int timeout, char *text) {
+     BIO *bio;
+     struct addrinfo *source = NULL;
+     char *subj;
++    struct list_node *entry;
+ 
+     debug(DBG_DBG, "dtlsconnect: called from %s", text);
+     pthread_mutex_lock(&server->lock);
+@@ -540,8 +561,6 @@ int dtlsconnect(struct server *server, int timeout, char *text) {
+ 
+     pthread_mutex_unlock(&server->lock);
+ 
+-    hp = (struct hostportres *)list_first(server->conf->hostports)->data;
+-
+     if(server->conf->source) {
+         source = resolvepassiveaddrinfo(server->conf->source, AF_UNSPEC, NULL, protodefs.socktype);
+         if(!source)
+@@ -552,13 +571,7 @@ int dtlsconnect(struct server *server, int timeout, char *text) {
+ 
+     for (;;) {
+         /* ensure previous connection is properly closed */
+-        if (server->ssl)
+-            SSL_shutdown(server->ssl);
+-        if (server->sock >= 0)
+-            close(server->sock);
+-        if (server->ssl)
+-            SSL_free(server->ssl);
+-        server->ssl = NULL;
++        cleanup_connection(server);
+ 
+         wait = connect_wait(start, server->connecttime, firsttry);
+         gettimeofday(&now, NULL);
+@@ -567,55 +580,84 @@ int dtlsconnect(struct server *server, int timeout, char *text) {
+             if (source) freeaddrinfo(source);
+             return 0;
+         }
+-        debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
++        if (wait) debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
+         sleep(wait);
+         firsttry = 0;
+ 
+-        debug(DBG_INFO, "dtlsconnect: connecting to %s port %s", hp->host, hp->port);
++        for (entry = list_first(server->conf->hostports); entry; entry = list_next(entry)) {
++            hp = (struct hostportres *)entry->data;
++            debug(DBG_INFO, "dtlsconnect: trying to open DTLS connection to server %s (%s port %s)", server->conf->name, hp->host, hp->port);
++            if ((server->sock = bindtoaddr(source ? source : srcres, hp->addrinfo->ai_family, 0)) < 0) {
++                debug(DBG_ERR, "dtlsconnect: faild to bind socket for server %s (%s port %s)", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
++            if (connect(server->sock, hp->addrinfo->ai_addr, hp->addrinfo->ai_addrlen)) {
++                debug(DBG_ERR, "dtlsconnect: faild to connect socket for server %s (%s port %s)", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
+ 
+-        if ((server->sock = bindtoaddr(source ? source : srcres, hp->addrinfo->ai_family, 0)) < 0)
+-            continue;
+-        if (connect(server->sock, hp->addrinfo->ai_addr, hp->addrinfo->ai_addrlen))
+-            continue;
++            pthread_mutex_lock(&server->conf->tlsconf->lock);
++            if (!(ctx = tlsgetctx(handle, server->conf->tlsconf))){
++                pthread_mutex_unlock(&server->conf->tlsconf->lock);
++                debug(DBG_ERR, "dtlsconnect: failed to get TLS context for server %s", server->conf->name);
++                goto concleanup;
++            }
+ 
+-        pthread_mutex_lock(&server->conf->tlsconf->lock);
+-        if (!(ctx = tlsgetctx(handle, server->conf->tlsconf))){
++            server->ssl = SSL_new(ctx);
+             pthread_mutex_unlock(&server->conf->tlsconf->lock);
+-            continue;
+-        }
++            if (!server->ssl) {
++                debug(DBG_ERR, "dtlsconnect: failed to create SSL conneciton for server %s", server->conf->name);
++                goto concleanup;
++            }
+ 
+-        server->ssl = SSL_new(ctx);
+-        pthread_mutex_unlock(&server->conf->tlsconf->lock);
+-        if (!server->ssl)
+-            continue;
++            if (server->conf->sni) {
++                struct in6_addr tmp;
++                char *servername = server->conf->sniservername ? server->conf->sniservername : 
++                    (inet_pton(AF_INET, hp->host, &tmp) || inet_pton(AF_INET6, hp->host, &tmp)) ? NULL : hp->host;
++                if (servername && !tlssetsni(server->ssl, servername)) {
++                    debug(DBG_ERR, "tlsconnect: set SNI %s failed", servername);
++                    goto concleanup;
++                }
++            }
+ 
+-        bio = BIO_new_dgram(server->sock, BIO_CLOSE);
+-        BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, hp->addrinfo->ai_addr);
+-        SSL_set_bio(server->ssl, bio, bio);
+-        if (sslconnecttimeout(server->ssl, 5) <= 0) {
+-            while ((error = ERR_get_error()))
+-                debug(DBG_ERR, "dtlsconnect: SSL connect to %s failed: %s", server->conf->name, ERR_error_string(error, NULL));
+-            debug(DBG_ERR, "dtlsconnect: SSL connect to %s failed", server->conf->name);
+-            continue;
+-        }
+-        socktimeout.tv_sec = 5;
+-        socktimeout.tv_usec = 0;
+-        if (BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &socktimeout) == -1)
+-            debug(DBG_WARN, "dtlsconnect: BIO_CTRL_DGRAM_SET_RECV_TIMEOUT failed");
++            bio = BIO_new_dgram(server->sock, BIO_CLOSE);
++            BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, hp->addrinfo->ai_addr);
++            SSL_set_bio(server->ssl, bio, bio);
++            if (sslconnecttimeout(server->ssl, 5) <= 0) {
++                while ((error = ERR_get_error()))
++                    debug(DBG_ERR, "dtlsconnect: SSL connect to %s failed: %s", server->conf->name, ERR_error_string(error, NULL));
++                debug(DBG_ERR, "dtlsconnect: SSL connect to %s (%s port %s) failed", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
++            socktimeout.tv_sec = 5;
++            socktimeout.tv_usec = 0;
++            if (BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &socktimeout) == -1)
++                debug(DBG_WARN, "dtlsconnect: BIO_CTRL_DGRAM_SET_RECV_TIMEOUT failed");
++
++            cert = verifytlscert(server->ssl);
++            if (!cert) {
++                debug(DBG_ERR, "tlsconnect: certificate verification failed for %s (%s port %s)", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
+ 
+-        cert = verifytlscert(server->ssl);
+-        if (!cert)
+-            continue;
+-        if (verifyconfcert(cert, server->conf)) {
+-            subj = getcertsubject(cert);
+-            if(subj) {
+-                debug(DBG_WARN, "dtlsconnect: DTLS connection to %s, subject %s up", server->conf->name, subj);
+-                free(subj);
++            if (verifyconfcert(cert, server->conf, hp)) {
++                subj = getcertsubject(cert);
++                if(subj) {
++                    debug(DBG_WARN, "dtlsconnect: DTLS connection to %s (%s port %s), subject %s up", server->conf->name, hp->host, hp->port, subj);
++                    free(subj);
++                }
++                X509_free(cert);
++                break;
++            } else {
++                debug(DBG_ERR, "tlsconnect: certificate verification failed for %s (%s port %s)", server->conf->name, hp->host, hp->port);
+             }
+             X509_free(cert);
+-            break;
++
++concleanup:
++            /* ensure previous connection is properly closed */
++            cleanup_connection(server);
+         }
+-        X509_free(cert);
++        if (server->ssl) break;
+     }
+ 
+     pthread_mutex_lock(&server->lock);
+diff --git a/hostport.c b/hostport.c
+index 6408505..d0651d4 100644
+--- a/hostport.c
++++ b/hostport.c
+@@ -222,7 +222,7 @@ int resolvehostports(struct list *hostports, int af, int socktype) {
+ }
+ 
+ struct addrinfo *resolvepassiveaddrinfo(char **hostport, int af, char *default_port, int socktype) {
+-    struct addrinfo *ai = NULL, *last_ai;
++    struct addrinfo *ai = NULL, *last_ai = NULL;
+     int i;
+     char *any[2] = {"*", NULL};
+ 
+@@ -258,7 +258,7 @@ static int prefixmatch(void *a1, void *a2, uint8_t len) {
+     return (((uint8_t *)a1)[l] & mask[r]) == (((uint8_t *)a2)[l] & mask[r]);
+ }
+ 
+-int _internal_addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t prefixlen, uint8_t checkport) {
++int _internal_addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t prefixlen, uint8_t checkport, struct hostportres **hpreturn) {
+     struct sockaddr_in6 *sa6 = NULL;
+     struct in_addr *a4 = NULL;
+     struct addrinfo *res;
+@@ -287,16 +287,20 @@ int _internal_addressmatches(struct list *hostports, struct sockaddr *addr, uint
+                     !memcmp(&sa6->sin6_addr,
+                     &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, 16) &&
+                     (!checkport || ((struct sockaddr_in6 *)res->ai_addr)->sin6_port ==
+-                    ((struct sockaddr_in6 *)addr)->sin6_port)))
++                    ((struct sockaddr_in6 *)addr)->sin6_port))) {
+ 
++                    if (hpreturn) *hpreturn = hp;
+                     return 1;
++                }
+             } else if (hp->prefixlen <= prefixlen) {
+                 if ((a4 && res->ai_family == AF_INET &&
+                     prefixmatch(a4, &((struct sockaddr_in *)res->ai_addr)->sin_addr, hp->prefixlen)) ||
+                     (sa6 && res->ai_family == AF_INET6 &&
+-                    prefixmatch(&sa6->sin6_addr, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, hp->prefixlen)))
++                    prefixmatch(&sa6->sin6_addr, &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, hp->prefixlen))) {
+ 
++                    if (hpreturn) *hpreturn = hp;
+                     return 1;
++                }
+             }
+         }
+     }
+@@ -312,18 +316,18 @@ int hostportmatches(struct list *hostports, struct list *matchhostports, uint8_t
+         match = (struct hostportres *)entry->data;
+ 
+         for (res = match->addrinfo; res; res = res->ai_next) {
+-            if (_internal_addressmatches(hostports, res->ai_addr, match->prefixlen, checkport))
++            if (_internal_addressmatches(hostports, res->ai_addr, match->prefixlen, checkport, NULL))
+                 return 1;
+         }
+     }
+     return 0;
+ }
+ 
+-int addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t checkport) {
+-    return _internal_addressmatches(hostports, addr, 255, checkport);
++int addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t checkport, struct hostportres **hp) {
++    return _internal_addressmatches(hostports, addr, 255, checkport, hp);
+ }
+ 
+-int connecttcphostlist(struct list *hostports,  struct addrinfo *src) {
++int connecttcphostlist(struct list *hostports,  struct addrinfo *src, struct hostportres** hpreturn) {
+     int s;
+     struct list_node *entry;
+     struct hostportres *hp = NULL;
+@@ -333,6 +337,7 @@ int connecttcphostlist(struct list *hostports,  struct addrinfo *src) {
+ 	debug(DBG_WARN, "connecttcphostlist: trying to open TCP connection to %s port %s", hp->host, hp->port);
+ 	if ((s = connecttcp(hp->addrinfo, src, list_count(hostports) > 1 ? 5 : 30)) >= 0) {
+ 	    debug(DBG_WARN, "connecttcphostlist: TCP connection to %s port %s up", hp->host, hp->port);
++        if (hpreturn) *hpreturn = hp;
+ 	    return s;
+ 	}
+     }
+diff --git a/hostport.h b/hostport.h
+index 9069ecd..a554a77 100644
+--- a/hostport.h
++++ b/hostport.h
+@@ -2,6 +2,9 @@
+  * Copyright (c) 2012, NORDUnet A/S */
+ /* See LICENSE for licensing information. */
+ 
++#ifndef _HOSTPORT_H
++#define _HOSTPORT_H
++
+ struct hostportres {
+     char *host;
+     char *port;
+@@ -17,9 +20,10 @@ int resolvehostport(struct hostportres *hp, int af, int socktype, uint8_t passiv
+ int resolvehostports(struct list *hostports, int af, int socktype);
+ struct addrinfo *resolvepassiveaddrinfo(char **hostport, int af, char *default_port, int socktype);
+ int hostportmatches(struct list *hostports, struct list *matchhostports, uint8_t checkport);
+-int addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t checkport);
+-int connecttcphostlist(struct list *hostports,  struct addrinfo *src);
++int addressmatches(struct list *hostports, struct sockaddr *addr, uint8_t checkport, struct hostportres **hp);
++int connecttcphostlist(struct list *hostports,  struct addrinfo *src, struct hostportres **hpreturn);
+ 
++#endif /* _HOSTPORT_H */
+ /* Local Variables: */
+ /* c-file-style: "stroustrup" */
+ /* End: */
+diff --git a/list.h b/list.h
+index f015b9d..c8c4531 100644
+--- a/list.h
++++ b/list.h
+@@ -35,7 +35,7 @@ int list_push(struct list *list, void *data);
+ /* removes first entry from list and returns data */
+ void *list_shift(struct list *list);
+ 
+-/* removes first entry with matching data pointer */
++/* removes all entries with matching data pointer */
+ void list_removedata(struct list *list, void *data);
+ 
+ /* returns first node */
+diff --git a/raddict.h b/raddict.h
+new file mode 100644
+index 0000000..8a9c598
+--- /dev/null
++++ b/raddict.h
+@@ -0,0 +1,42 @@
++#ifndef _RADDICT_H
++#define _RADDICT_H
++
++const char* RAD_Attr_Acct_Terminate_Cause_Dict[] = {
++        [1] = "User-Request",
++        "Lost-Carrier",
++        "Lost-Service",
++        "Idle-Timeout",
++        "Session-Timeout",
++        "Admin-Reset",
++        "Admin-Reboot",
++        "Port-Error",
++        "NAS-Error",
++        "NAS-Request",
++        "NAS-Reboot",
++        "Port-Unneeded",
++        "Port-Preempted",
++        "Port-Suspended",
++        "Service-Unavailable",
++        "Callback",
++        "User-Error",
++        "Host-Request",
++};
++
++const char* RAD_Attr_Acct_Status_Type_Dict[] = {
++        [1] = "Start",
++        [2] = "Stop",
++        [3] = "Interim-Update",
++        [7] = "Accounting-On",
++        [8] = "Accounting-Off",
++        [9] = "Tunnel-Start",
++        [10] = "Tunnel-Stop",
++        [11] = "Tunnel-Reject",
++        [12] = "Tunnel-Link-Start",
++        [13] = "Tunnel-Link-Stop",
++        [14] = "Tunnel-Link-Reject",
++        [15] = "Failed",
++};
++
++#define RAD_Attr_Dict_Undef "UNKNOWN"
++
++#endif /*_RADDICT_H*/
+diff --git a/radmsg.c b/radmsg.c
+index 5f49237..afd7c60 100644
+--- a/radmsg.c
++++ b/radmsg.c
+@@ -15,6 +15,8 @@
+ #include <pthread.h>
+ #include <nettle/hmac.h>
+ #include <openssl/rand.h>
++#include "raddict.h"
++#include "util.h"
+ 
+ #define RADLEN(x) ntohs(((uint16_t *)(x))[1])
+ 
+@@ -414,6 +416,28 @@ int resizeattr(struct tlv *attr, uint8_t newlen) {
+     return 0;
+ }
+ 
++const char* attrval2strdict(struct tlv *attr) {
++    uint32_t val;
++
++    if(!attr) return NULL;
++    val = tlv2longint(attr);
++    switch (attr->t) {
++        case RAD_Attr_Acct_Status_Type:
++            if(val < sizeof(RAD_Attr_Acct_Status_Type_Dict)/sizeof(RAD_Attr_Acct_Status_Type_Dict[0]))
++                return RAD_Attr_Acct_Status_Type_Dict[val] ? RAD_Attr_Acct_Status_Type_Dict[val] : RAD_Attr_Dict_Undef;
++            break;
++
++        case RAD_Attr_Acct_Terminate_Cause:
++            if(val < sizeof(RAD_Attr_Acct_Terminate_Cause_Dict)/sizeof(RAD_Attr_Acct_Terminate_Cause_Dict[0]))
++                return RAD_Attr_Acct_Terminate_Cause_Dict[val] ? RAD_Attr_Acct_Terminate_Cause_Dict[val] : RAD_Attr_Dict_Undef;
++            break;
++
++        default:
++            break;
++    }
++    return NULL;
++}
++
+ /* Local Variables: */
+ /* c-file-style: "stroustrup" */
+ /* End: */
+diff --git a/radmsg.h b/radmsg.h
+index 1738c8e..634cf13 100644
+--- a/radmsg.h
++++ b/radmsg.h
+@@ -21,16 +21,37 @@
+ #define RAD_Attr_User_Name 1
+ #define RAD_Attr_User_Password 2
+ #define RAD_Attr_CHAP_Password 3
++#define RAD_Attr_NAS_IP_Address 4
++#define RAD_Attr_Framed_IP_Address 8
+ #define RAD_Attr_Reply_Message 18
+ #define RAD_Attr_Vendor_Specific 26
++#define RAD_Attr_Called_Station_Id 30
+ #define RAD_Attr_Calling_Station_Id 31
+ #define RAD_Attr_Proxy_State 33
++#define RAD_Attr_Acct_Status_Type 40
++#define RAD_Attr_Acct_Input_Octets 42
++#define RAD_Attr_Acct_Output_Octets 43
++#define RAD_Attr_Acct_Session_Id 44
++#define RAD_Attr_Acct_Session_Time 46
++#define RAD_Attr_Acct_Input_Packets 47
++#define RAD_Attr_Acct_Output_Packets 48
++#define RAD_Attr_Acct_Terminate_Cause 49
++#define RAD_Attr_Event_Timestamp 55
+ #define RAD_Attr_CHAP_Challenge 60
+ #define RAD_Attr_Tunnel_Password 69
+ #define RAD_Attr_Message_Authenticator 80
+ #define RAD_Attr_CUI 89
+ #define RAD_Attr_Operator_Name 126
+ 
++#define RAD_Acct_Status_Start 1
++#define RAD_Acct_Status_Stop 2
++#define RAD_Acct_Status_Alive 3
++#define RAD_Acct_Status_Interim_Update 3
++#define RAD_Acct_Status_Accounting_On 7
++#define RAD_Acct_Status_Accounting_Off 8
++#define RAD_Acct_Status_Failed 15
++
++
+ #define RAD_VS_ATTR_MS_MPPE_Send_Key 16
+ #define RAD_VS_ATTR_MS_MPPE_Recv_Key 17
+ 
+@@ -63,6 +84,16 @@ int attrvalidate(unsigned char *attrs, int length);
+ struct tlv *makevendortlv(uint32_t vendor, struct tlv *attr);
+ int resizeattr(struct tlv *attr, uint8_t newlen);
+ 
++/**
++ * convert the attribute value to its string representation form the dictionary 
++ * (see raddict.h)
++ * 
++ * @param attr the attribute to convert
++ * @return the string representation or NULL, if the attribute/value is not in the 
++ * dictionary
++ */
++const char* attrval2strdict(struct tlv *attr);
++
+ #endif /*_RADMSG_H*/
+ 
+ /* Local Variables: */
+diff --git a/radsecproxy.c b/radsecproxy.c
+index c755acb..75f5ef3 100644
+--- a/radsecproxy.c
++++ b/radsecproxy.c
+@@ -121,13 +121,13 @@ int prefixmatch(void *a1, void *a2, uint8_t len) {
+ }
+ 
+ /* returns next config with matching address, or NULL */
+-struct clsrvconf *find_conf(uint8_t type, struct sockaddr *addr, struct list *confs, struct list_node **cur, uint8_t server_p) {
++struct clsrvconf *find_conf(uint8_t type, struct sockaddr *addr, struct list *confs, struct list_node **cur, uint8_t server_p, struct hostportres **hp) {
+     struct list_node *entry;
+     struct clsrvconf *conf;
+ 
+     for (entry = (cur && *cur ? list_next(*cur) : list_first(confs)); entry; entry = list_next(entry)) {
+ 	conf = (struct clsrvconf *)entry->data;
+-	if (conf->type == type && addressmatches(conf->hostports, addr, server_p)) {
++	if (conf->type == type && addressmatches(conf->hostports, addr, server_p, hp)) {
+ 	    if (cur)
+ 		*cur = entry;
+ 	    return conf;
+@@ -136,12 +136,12 @@ struct clsrvconf *find_conf(uint8_t type, struct sockaddr *addr, struct list *co
+     return NULL;
+ }
+ 
+-struct clsrvconf *find_clconf(uint8_t type, struct sockaddr *addr, struct list_node **cur) {
+-    return find_conf(type, addr, clconfs, cur, 0);
++struct clsrvconf *find_clconf(uint8_t type, struct sockaddr *addr, struct list_node **cur, struct hostportres **hp) {
++    return find_conf(type, addr, clconfs, cur, 0, hp);
+ }
+ 
+ struct clsrvconf *find_srvconf(uint8_t type, struct sockaddr *addr, struct list_node **cur) {
+-    return find_conf(type, addr, srvconfs, cur, 1);
++    return find_conf(type, addr, srvconfs, cur, 1, NULL);
+ }
+ 
+ /* returns next config of given type, or NULL */
+@@ -1241,6 +1241,49 @@ void rmclientrq(struct request *rq, uint8_t id) {
+     }
+ }
+ 
++static void log_accounting_resp(struct client *from, struct radmsg *msg, char *user) {
++    char tmp[INET6_ADDRSTRLEN];
++    const char* status_type = attrval2strdict(radmsg_gettype(msg, RAD_Attr_Acct_Status_Type));
++    char* nas_ip_address = tlv2ipv4addr(radmsg_gettype(msg, RAD_Attr_NAS_IP_Address));
++    char* framed_ip_address = tlv2ipv4addr(radmsg_gettype(msg, RAD_Attr_Framed_IP_Address));
++
++    time_t event_timestamp_i = tlv2longint(radmsg_gettype(msg, RAD_Attr_Event_Timestamp));
++    char event_timestamp[32]; /* timestamp should be at most 21 bytes, leave a few spare */
++
++    uint8_t *session_id = radattr2ascii(radmsg_gettype(msg, RAD_Attr_Acct_Session_Id));
++    uint8_t *called_station_id = radattr2ascii(radmsg_gettype(msg, RAD_Attr_Called_Station_Id));
++    uint8_t *calling_station_id = radattr2ascii(radmsg_gettype(msg, RAD_Attr_Calling_Station_Id));
++    const char* terminate_cause = attrval2strdict(radmsg_gettype(msg, RAD_Attr_Acct_Terminate_Cause));
++
++    strftime(event_timestamp, sizeof(event_timestamp), "%FT%TZ", gmtime(&event_timestamp_i));
++
++    debug(DBG_NOTICE, "Accounting %s (id %d) at %s from client %s (%s): { SID=%s, User-Name=%s, Ced-S-Id=%s, Cing-S-Id=%s, NAS-IP=%s, Framed-IP=%s, Sess-Time=%u, In-Packets=%u, In-Octets=%u, Out-Packets=%u, Out-Octets=%u, Terminate-Cause=%s }",
++        status_type ? status_type : "UNKNOWN",
++        msg->id,
++        event_timestamp_i ? event_timestamp : "UNKNOWN",
++        from->conf->name,
++        addr2string(from->addr, tmp, sizeof(tmp)),
++
++        session_id ? session_id : (uint8_t*)"",
++        user,
++        called_station_id ? called_station_id : (uint8_t*)"",
++        calling_station_id ? calling_station_id : (uint8_t*)"",
++        nas_ip_address ? nas_ip_address : "0.0.0.0",
++        framed_ip_address ? framed_ip_address : "0.0.0.0",
++        tlv2longint(radmsg_gettype(msg, RAD_Attr_Acct_Session_Time)),
++        tlv2longint(radmsg_gettype(msg, RAD_Attr_Acct_Input_Packets)),
++        tlv2longint(radmsg_gettype(msg, RAD_Attr_Acct_Input_Octets)),
++        tlv2longint(radmsg_gettype(msg, RAD_Attr_Acct_Output_Packets)),
++        tlv2longint(radmsg_gettype(msg, RAD_Attr_Acct_Output_Octets)),
++        terminate_cause ? terminate_cause : ""
++    );
++    free(framed_ip_address);
++    free(nas_ip_address);
++    free(session_id);
++    free(called_station_id);
++    free(calling_station_id);
++}
++
+ /* Called from server readers, handling incoming requests from
+  * clients. */
+ /* returns 0 if validation/authentication fails, else 1 */
+@@ -1321,13 +1364,15 @@ int radsrv(struct request *rq) {
+     }
+ 
+     if (!to) {
+-	if (realm->message && msg->code == RAD_Access_Request) {
+-	    debug(DBG_INFO, "radsrv: sending %s (id %d) to %s (%s) for %s", radmsgtype2string(RAD_Access_Reject), msg->id, from->conf->name, addr2string(from->addr, tmp, sizeof(tmp)), userascii);
+-	    respond(rq, RAD_Access_Reject, realm->message, 1, 1);
+-	} else if (realm->accresp && msg->code == RAD_Accounting_Request) {
+-	    respond(rq, RAD_Accounting_Response, NULL, 1, 0);
+-	}
+-	goto exit;
++        if (realm->message && msg->code == RAD_Access_Request) {
++            debug(DBG_INFO, "radsrv: sending %s (id %d) to %s (%s) for %s", radmsgtype2string(RAD_Access_Reject), msg->id, from->conf->name, addr2string(from->addr, tmp, sizeof(tmp)), userascii);
++            respond(rq, RAD_Access_Reject, realm->message, 1, 1);
++        } else if (realm->accresp && msg->code == RAD_Accounting_Request) {
++            if (realm->acclog) 
++                log_accounting_resp(from, msg, (char *)userascii);
++            respond(rq, RAD_Accounting_Response, NULL, 1, 0);
++        }
++        goto exit;
+     }
+ 
+     if ((to->conf->loopprevention == 1
+@@ -1592,7 +1637,7 @@ void *clientwr(void *arg) {
+     if (server->dynamiclookuparg && !dynamicconfig(server)) {
+         dynconffail = 1;
+         server->state = RSP_SERVER_STATE_FAILING;
+-        debug(DBG_WARN, "%s: dynamicconfig(%s: %s) failed, sleeping %ds",
++        debug(DBG_WARN, "%s: dynamicconfig(%s: %s) failed, Not trying again for %ds",
+               __func__, server->conf->name, server->dynamiclookuparg, ZZZ);
+         goto errexitwait;
+     }
+@@ -1600,7 +1645,7 @@ void *clientwr(void *arg) {
+      * either as part of static configuration setup or by
+      * dynamicconfig() above?  */
+     if (!resolvehostports(conf->hostports, conf->hostaf, conf->pdef->socktype)) {
+-        debug(DBG_WARN, "%s: resolve failed, sleeping %ds", __func__, ZZZ);
++        debug(DBG_WARN, "%s: resolve failed, Not trying again for %ds", __func__, ZZZ);
+         server->state = RSP_SERVER_STATE_FAILING;
+         goto errexitwait;
+     }
+@@ -1615,7 +1660,7 @@ void *clientwr(void *arg) {
+         if (!conf->pdef->connecter(server, server->dynamiclookuparg ? 5 : 0, "clientwr")) {
+             server->state = RSP_SERVER_STATE_FAILING;
+             if (server->dynamiclookuparg) {
+-                debug(DBG_WARN, "%s: connect failed, sleeping %ds", __func__, ZZZ);
++                debug(DBG_WARN, "%s: connect failed, giving up. Not trying again for %ds", __func__, ZZZ);
+                 goto errexitwait;
+             }
+             goto errexit;
+@@ -1927,7 +1972,7 @@ void freerealm(struct realm *realm) {
+     free(realm);
+ }
+ 
+-struct realm *addrealm(struct list *realmlist, char *value, char **servers, char **accservers, char *message, uint8_t accresp) {
++struct realm *addrealm(struct list *realmlist, char *value, char **servers, char **accservers, char *message, uint8_t accresp, uint8_t acclog) {
+     int n;
+     struct realm *realm;
+     char *s, *regex = NULL;
+@@ -1991,6 +2036,7 @@ struct realm *addrealm(struct list *realmlist, char *value, char **servers, char
+     }
+     realm->message = message;
+     realm->accresp = accresp;
++    realm->acclog = acclog;
+ 
+     if (regcomp(&realm->regex, regex ? regex : value + 1, REG_EXTENDED | REG_ICASE | REG_NOSUB)) {
+ 	debug(DBG_ERR, "addrealm: failed to compile regular expression %s", regex ? regex : value + 1);
+@@ -2111,7 +2157,7 @@ struct realm *adddynamicrealmserver(struct realm *realm, char *id) {
+     if (!realm->subrealms)
+ 	return NULL;
+ 
+-    newrealm = addrealm(realm->subrealms, realmname, NULL, NULL, stringcopy(realm->message, 0), realm->accresp);
++    newrealm = addrealm(realm->subrealms, realmname, NULL, NULL, stringcopy(realm->message, 0), realm->accresp, realm->acclog);
+     if (!newrealm) {
+ 	list_destroy(realm->subrealms);
+ 	realm->subrealms = NULL;
+@@ -2223,6 +2269,7 @@ void freeclsrvconf(struct clsrvconf *conf) {
+     freematchcertattr(conf);
+     free(conf->confrewritein);
+     free(conf->confrewriteout);
++    free(conf->sniservername);
+     if (conf->rewriteusername) {
+ 	if (conf->rewriteusername->regex)
+ 	    regfree(conf->rewriteusername->regex);
+@@ -2316,7 +2363,8 @@ int mergesrvconf(struct clsrvconf *dst, struct clsrvconf *src) {
+ 	!mergeconfstring(&dst->confrewriteusername, &src->confrewriteusername) ||
+ 	!mergeconfstring(&dst->dynamiclookupcommand, &src->dynamiclookupcommand) ||
+ 	!mergeconfstring(&dst->fticks_viscountry, &src->fticks_viscountry) ||
+-	!mergeconfstring(&dst->fticks_visinst, &src->fticks_visinst))
++	!mergeconfstring(&dst->fticks_visinst, &src->fticks_visinst) ||
++    !mergeconfstring(&dst->sniservername, &src->sniservername))
+ 	return 0;
+     if (src->pdef)
+ 	dst->pdef = src->pdef;
+@@ -2327,6 +2375,7 @@ int mergesrvconf(struct clsrvconf *dst, struct clsrvconf *src) {
+     if (src->retrycount != 255)
+ 	dst->retrycount = src->retrycount;
+     dst->blockingstartup = src->blockingstartup;
++    dst->sni = src->sni;
+     return 1;
+ }
+ 
+@@ -2416,7 +2465,7 @@ int confclient_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+                 ? tlsgettls(conf->tls, NULL)
+                 : tlsgettls("defaultClient", "default");
+         if (!conf->tlsconf)
+-            debugx(1, DBG_ERR, "error in block %s, no tls context defined", block);
++            debugx(1, DBG_ERR, "error in block %s, tls context not defined", block);
+         if (matchcertattrs) {
+             for (i=0; matchcertattrs[i]; i++){
+                 if (!addmatchcertattr(conf, matchcertattrs[i])) {
+@@ -2485,7 +2534,7 @@ int confclient_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+                 existing->tlsconf != conf->tlsconf &&
+                 hostportmatches(existing->hostports, conf->hostports, 0)) {
+ 
+-                debugx(1, DBG_ERR, "error in block %s, overlapping clients must reference the same tls block", block);
++                debugx(1, DBG_ERR, "error in block %s, masked by overlapping (equal or less specific IP/prefix) client %s with different tls block", block, existing->name);
+             }
+         }
+     }
+@@ -2573,8 +2622,12 @@ int confserver_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+     if (resconf) {
+         conf->statusserver = resconf->statusserver;
+         conf->certnamecheck = resconf->certnamecheck;
++        conf->blockingstartup = resconf->blockingstartup;
++        conf->type = resconf->type;
++        conf->sni = resconf->sni;
+     } else {
+         conf->certnamecheck = 1;
++        conf->sni = options.sni;
+     }
+ 
+     if (!getgenericconfig(cf, block,
+@@ -2601,6 +2654,8 @@ int confserver_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+             "DynamicLookupCommand", CONF_STR, &conf->dynamiclookupcommand,
+             "LoopPrevention", CONF_BLN, &conf->loopprevention,
+             "BlockingStartup", CONF_BLN, &conf->blockingstartup,
++            "SNI", CONF_BLN, &conf->sni,
++            "SNIservername", CONF_STR, &conf->sniservername,
+             NULL
+ 	    )) {
+ 	debug(DBG_ERR, "configuration error");
+@@ -2621,16 +2676,20 @@ int confserver_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+     }
+ 
+     if (!conftype) {
+-	debug(DBG_ERR, "error in block %s, option type missing", block);
+-	goto errexit;
+-    }
+-    conf->type = protoname2int(conftype);
+-    if (conf->type == 255) {
+-	debug(DBG_ERR, "error in block %s, unknown transport %s", block, conftype);
+-	goto errexit;
++        if (!resconf) {
++            debug(DBG_ERR, "error in block %s, option type missing", block);
++            goto errexit;
++        }
++    } else {
++        conf->type = protoname2int(conftype);
++        if (conf->type == 255) {
++            debug(DBG_ERR, "error in block %s, unknown transport %s", block, conftype);
++            goto errexit;
++        }
++        free(conftype);
++        conftype = NULL;
++        conf->pdef = protodefs[conf->type];
+     }
+-    free(conftype);
+-    conftype = NULL;
+ 
+     conf->hostaf = AF_UNSPEC;
+     if (config_hostaf("top level", options.ipv4only, options.ipv6only, &conf->hostaf))
+@@ -2638,8 +2697,6 @@ int confserver_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+     if (config_hostaf(block, ipv4only, ipv6only, &conf->hostaf))
+         goto errexit;
+ 
+-    conf->pdef = protodefs[conf->type];
+-
+     if (!conf->confrewritein)
+ 	conf->confrewritein = rewriteinalias;
+     else
+@@ -2683,8 +2740,12 @@ int confserver_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+             conf->statusserver = RSP_STATSRV_AUTO;
+         else
+             debugx(1, DBG_ERR, "config error in blocck %s: invalid StatusServer value: %s", block, statusserver);
++        free(statusserver);
+     }
+ 
++    if(conf->sniservername)
++        conf->sni = 1;
++
+     if (resconf) {
+         if (!mergesrvconf(resconf, conf))
+             goto errexit;
+@@ -2769,7 +2830,7 @@ int confrewrite_cb(struct gconffile **cf, void *arg, char *block, char *opt, cha
+ 
+ int confrealm_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *val) {
+     char **servers = NULL, **accservers = NULL, *msg = NULL;
+-    uint8_t accresp = 0;
++    uint8_t accresp = 0, acclog = 0;
+ 
+     debug(DBG_DBG, "confrealm_cb called for %s", block);
+ 
+@@ -2778,11 +2839,12 @@ int confrealm_cb(struct gconffile **cf, void *arg, char *block, char *opt, char
+ 			  "accountingServer", CONF_MSTR, &accservers,
+ 			  "ReplyMessage", CONF_STR, &msg,
+ 			  "AccountingResponse", CONF_BLN, &accresp,
++              "AccountingLog", CONF_BLN, &acclog,
+ 			  NULL
+ 	    ))
+ 	debugx(1, DBG_ERR, "configuration error");
+ 
+-    addrealm(realms, val, servers, accservers, msg, accresp);
++    addrealm(realms, val, servers, accservers, msg, accresp, acclog);
+     return 1;
+ }
+ 
+@@ -2871,6 +2933,7 @@ void getmainconfig(const char *configfile) {
+         "FTicksPrefix", CONF_STR, &options.fticksprefix,
+         "IPv4Only", CONF_BLN, &options.ipv4only,
+         "IPv6Only", CONF_BLN, &options.ipv6only,
++        "SNI", CONF_BLN, &options.sni,
+ 	    NULL
+ 	    ))
+ 	debugx(1, DBG_ERR, "configuration error");
+@@ -3031,6 +3094,7 @@ int createpidfile(const char *pidfile) {
+ int radsecproxy_main(int argc, char **argv) {
+     pthread_t sigth;
+     sigset_t sigset;
++    size_t stacksize;
+     struct list_node *entry;
+     uint8_t foreground = 0, pretend = 0, loglevel = 0;
+     char *configfile = NULL, *pidfile = NULL;
+@@ -3042,8 +3106,13 @@ int radsecproxy_main(int argc, char **argv) {
+ 
+     if (pthread_attr_init(&pthread_attr))
+ 	debugx(1, DBG_ERR, "pthread_attr_init failed");
+-    if (pthread_attr_setstacksize(&pthread_attr, PTHREAD_STACK_SIZE))
+-	debugx(1, DBG_ERR, "pthread_attr_setstacksize failed");
++#if defined(PTHREAD_STACK_MIN)
++    stacksize = THREAD_STACK_SIZE > PTHREAD_STACK_MIN ? THREAD_STACK_SIZE : PTHREAD_STACK_MIN;
++#else
++    stacksize = THREAD_STACK_SIZE;
++#endif
++    if (pthread_attr_setstacksize(&pthread_attr, stacksize))
++        debug(DBG_WARN, "pthread_attr_setstacksize failed! Using system default. Memory footprint might be increased!");
+ #if defined(HAVE_MALLOPT)
+     if (mallopt(M_TRIM_THRESHOLD, 4 * 1024) != 1)
+ 	debugx(1, DBG_ERR, "mallopt failed");
+diff --git a/radsecproxy.conf-example b/radsecproxy.conf-example
+index 1730e55..3b2dd64 100644
+--- a/radsecproxy.conf-example
++++ b/radsecproxy.conf-example
+@@ -203,6 +203,8 @@ server radius.example.com {
+ # statusserver is optional, can be on or off. Off is default
+ 	tcpKeepalive on
+ # tcp and tls connections also support TCP keepalives.
++# Optionally specify the SNI for the outgoing connection
++#       sni www.example.com
+ }
+ #server radius.example.com {
+ #	type	dtls
+diff --git a/radsecproxy.conf.5.in b/radsecproxy.conf.5.in
+index 87482c1..ebedd6c 100644
+--- a/radsecproxy.conf.5.in
++++ b/radsecproxy.conf.5.in
+@@ -297,6 +297,15 @@ clients and servers. At most one of IPv4Only and IPv6Only can be enabled.
+ Note that this can be overridden in client and server blocks, see below.
+ .RE
+ 
++.BR "SNI (" on | off )
++.RS
++Server Name Indication (SNI) is an extension to the TLS protocol.  It allows a
++client to indicate which hostname it is trying to connect to at the start of
++the TLS handshake. Enabling this will use the extension for all TLS and DTLS
++servers which specify a hostname (not IP address). This can be overridden in 
++server blocks, see below.
++.RE
++
+ .BI "Include " file
+ .RS
+ This is not a normal configuration option; it can be specified multiple times.
+@@ -350,10 +359,11 @@ this might mask clients defined later, which then will never be matched.
+ 
+ In the case of TLS/DTLS, the name of the client must match the FQDN or IP
+ address in the client certificate (CN or SubectAltName:DNS or SubjectAltName:IP
+-respectively). Note that this is not required when the client name is an IP
+-prefix. If overlapping clients are defined (see section above), they will be
+-searched for matching \fBMatchCertificateAttribute\fR, but they must reference
+-the same tls block.
++respectively) and any \fBMatchCertificateAttribute\fR to be positively identified. 
++Note that no FQDN/IP is checked when using an IP prefix. 
++If overlapping clients are defined (see section above), they will be searched for 
++positive identification, but only among clients referencing the same tls block
++(selected by the first matching IP address or prefix).
+ 
+ The allowed options in a client block are:
+ 
+@@ -620,6 +630,19 @@ Warning: when the dynamic lookup and connection process is slow, this wil block
+ respective realm for that time.
+ .RE
+ 
++.BR "SNI (" on | off )
++
++.RS
++Override gobal SNI setting (see above). This is implicitly enabled if \fBSNIservername\fR
++is set.
++.RE
++
++.BI "SNIservername " sni
++.RS
++Explicitly set the \fIsni\fR to request from the server, in case the server is specified
++by IP address or to override the hostname. Implicitly enables \fBSNI\fR for this server.
++.RE
++
+ The meaning and syntax of the following options are exactly the same as for the client
+ block. The details are not repeated here. Please refer to the definitions in the \fBCLIENT BLOCK\fR section.
+ 
+@@ -679,6 +702,12 @@ Enable sending Accounting-Response instead of ignoring Accounting-Requests when
+ no \fBaccoutingServer\fR are configured.
+ .RE
+ 
++.BR "AccountingLog (" on | off )
++.RS
++When responding to Accounting-Requests (\fBAccountingResponse on\fR), log the 
++accounting data.
++.RE
++
+ .BI "ReplyMessage " message
+ .RS
+ Specify a message to be sent back to the client if a Access-Request is denied
+@@ -852,7 +881,8 @@ for DTLS.
+ .BI "DhFile " file
+ .RS
+ DH parameter \fIfile\fR to use. See \fBopenssl-dhparam\fR(1)
+-
++.br
++Note: starting with OpenSSL 3.0, use of custom DH parameters is discouraged.
+ 
+ .SH "REWRITE BLOCK"
+ .nf
+diff --git a/radsecproxy.h b/radsecproxy.h
+index cf493b4..8844415 100644
+--- a/radsecproxy.h
++++ b/radsecproxy.h
+@@ -11,6 +11,7 @@
+ #include "radmsg.h"
+ #include "gconfig.h"
+ #include "rewrite.h"
++#include "hostport.h"
+ 
+ #include <openssl/asn1.h>
+ 
+@@ -28,15 +29,9 @@
+ #define STATUS_SERVER_PERIOD 25
+ #define IDLE_TIMEOUT 300
+ 
+-/* We want PTHREAD_STACK_SIZE to be 32768, but some platforms
+- * have a higher minimum value defined in PTHREAD_STACK_MIN. */
+-#define PTHREAD_STACK_SIZE 32768
+-#if defined(PTHREAD_STACK_MIN)
+-#if PTHREAD_STACK_MIN > PTHREAD_STACK_SIZE
+-#undef PTHREAD_STACK_SIZE
+-#define PTHREAD_STACK_SIZE PTHREAD_STACK_MIN
+-#endif
+-#endif
++/* Target value for stack size.
++ * Some platforms might define higher minimums in PTHREAD_STACK_MIN. */
++#define THREAD_STACK_SIZE 32768
+ 
+ /* For systems that only support RFC 2292 Socket API, but not RFC 3542
+  * like Cygwin */
+@@ -103,6 +98,7 @@ struct options {
+     uint8_t *fticks_key;
+     uint8_t ipv4only;
+     uint8_t ipv6only;
++    uint8_t sni;
+ };
+ 
+ struct commonprotoopts {
+@@ -176,6 +172,8 @@ struct clsrvconf {
+     struct server *servers;
+     char *fticks_viscountry;
+     char *fticks_visinst;
++    uint8_t sni;
++    char *sniservername;
+ };
+ 
+ #include "tlscommon.h"
+@@ -216,6 +214,7 @@ struct realm {
+     char *name;
+     char *message;
+     uint8_t accresp;
++    uint8_t acclog;
+     regex_t regex;
+     uint32_t refcount;
+     pthread_mutex_t refmutex;
+@@ -250,7 +249,7 @@ struct protodefs {
+ 
+ #define RADLEN(x) ntohs(((uint16_t *)(x))[1])
+ 
+-struct clsrvconf *find_clconf(uint8_t type, struct sockaddr *addr, struct list_node **cur);
++struct clsrvconf *find_clconf(uint8_t type, struct sockaddr *addr, struct list_node **cur, struct hostportres **hp);
+ struct clsrvconf *find_srvconf(uint8_t type, struct sockaddr *addr, struct list_node **cur);
+ struct clsrvconf *find_clconf_type(uint8_t type, struct list_node **cur);
+ struct client *addclient(struct clsrvconf *conf, uint8_t lock);
+diff --git a/tcp.c b/tcp.c
+index ffb2f4c..e148ed0 100644
+--- a/tcp.c
++++ b/tcp.c
+@@ -22,6 +22,7 @@
+ #include <pthread.h>
+ #include "radsecproxy.h"
+ #include "hostport.h"
++#include "list.h"
+ 
+ #ifdef RADPROT_TCP
+ #include "debug.h"
+@@ -84,6 +85,8 @@ int tcpconnect(struct server *server, int timeout, char *text) {
+     int firsttry = 1;
+     time_t wait;
+     struct addrinfo *source = NULL;
++    struct list_node *entry;
++    struct hostportres *hp;
+ 
+     debug(DBG_DBG, "tcpconnect: called from %s", text);
+     pthread_mutex_lock(&server->lock);
+@@ -112,16 +115,25 @@ int tcpconnect(struct server *server, int timeout, char *text) {
+             if (source) freeaddrinfo(source);
+             return 0;
+         }
+-        debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
++        if (wait) debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
+         sleep(wait);
+         firsttry = 0;
+ 
+-        
+         pthread_mutex_lock(&server->lock);
+ 
+-        debug(DBG_INFO, "tcpconnect: connecting to %s", server->conf->name);
+-        if ((server->sock = connecttcphostlist(server->conf->hostports, source ? source : srcres)) < 0)
++        for (entry = list_first(server->conf->hostports); entry; entry = list_next(entry)) {
++            hp = (struct hostportres *)entry->data;
++            debug(DBG_INFO, "tcpconnect: trying to open TCP connection to server %s (%s port %s)", server->conf->name, hp->host, hp->port);
++            if ((server->sock = connecttcp(hp->addrinfo, source ? source : srcres, list_count(server->conf->hostports) > 1 ? 5 : 30)) >= 0) {
++                debug(DBG_WARN, "tcpconnect: TCP connection to server %s (%s port %s) up", hp->host, hp->port);
++                break;
++            }
++        }
++        if (server->sock < 0) {
++            debug(DBG_ERR, "tcpconnect: TCP connection to server %s failed", server->conf->name);
+             continue;
++        }
++
+         if (server->conf->keepalive)
+             enable_keepalive(server->sock);
+         break;
+@@ -339,7 +351,7 @@ void *tcpservernew(void *arg) {
+     }
+     debug(DBG_WARN, "tcpservernew: incoming TCP connection from %s", addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));
+ 
+-    conf = find_clconf(handle, (struct sockaddr *)&from, NULL);
++    conf = find_clconf(handle, (struct sockaddr *)&from, NULL, NULL);
+     if (conf) {
+         client = addclient(conf, 1);
+         if (client) {
+diff --git a/tests/t_verify_cert.c b/tests/t_verify_cert.c
+index ca0d47e..b52a990 100644
+--- a/tests/t_verify_cert.c
++++ b/tests/t_verify_cert.c
+@@ -234,7 +234,7 @@ vY/uPjA=\n\
+         hp.prefixlen = 255;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1, verifyconfcert(certsimple, &conf), "check disabled");
++        ok(1, verifyconfcert(certsimple, &conf, &hp), "check disabled");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -249,7 +249,7 @@ vY/uPjA=\n\
+         hp.prefixlen = 0;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1,verifyconfcert(certsimple, &conf),"cidr prefix");
++        ok(1,verifyconfcert(certsimple, &conf, &hp),"cidr prefix");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -264,11 +264,11 @@ vY/uPjA=\n\
+         hp.prefixlen = 255;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1,verifyconfcert(certsimple, &conf), "simple cert cn");
+-        ok(0,verifyconfcert(certsimpleother, &conf), "negative simple cert cn");
++        ok(1,verifyconfcert(certsimple, &conf, &hp), "simple cert cn");
++        ok(0,verifyconfcert(certsimpleother, &conf, &hp), "negative simple cert cn");
+ 
+         /* as per RFC 6125 6.4.4: CN MUST NOT be matched if SAN is present */
+-        ok(0,verifyconfcert(certsandns, &conf), "simple cert cn vs san dns, RFC6125");
++        ok(0,verifyconfcert(certsandns, &conf, &hp), "simple cert cn vs san dns, RFC6125");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -284,11 +284,11 @@ vY/uPjA=\n\
+         hp.prefixlen = 255;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1,verifyconfcert(certsanip, &conf),"san ip");
+-        ok(0,verifyconfcert(certsanipother, &conf),"wrong san ip");
+-        ok(0,verifyconfcert(certsimple, &conf), "negative san ip");
+-        ok(1,verifyconfcert(certsanipindns, &conf),"san ip in dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"san ip in complex cert");
++        ok(1,verifyconfcert(certsanip, &conf, &hp),"san ip");
++        ok(0,verifyconfcert(certsanipother, &conf, &hp),"wrong san ip");
++        ok(0,verifyconfcert(certsimple, &conf, &hp), "negative san ip");
++        ok(1,verifyconfcert(certsanipindns, &conf, &hp),"san ip in dns");
++        ok(1,verifyconfcert(certcomplex,&conf, &hp),"san ip in complex cert");
+ 
+         freeaddrinfo(hp.addrinfo);
+         while(list_shift(conf.hostports));
+@@ -306,11 +306,11 @@ vY/uPjA=\n\
+         hp.prefixlen = 255;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1,verifyconfcert(certsanipv6, &conf),"san ipv6");
+-        ok(0,verifyconfcert(certsanipother, &conf),"wrong san ipv6");
+-        ok(0,verifyconfcert(certsimple, &conf),"negative san ipv6");
+-        ok(1,verifyconfcert(certsanipv6indns, &conf),"san ipv6 in dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"san ipv6 in complex cert");
++        ok(1,verifyconfcert(certsanipv6, &conf, &hp),"san ipv6");
++        ok(0,verifyconfcert(certsanipother, &conf, &hp),"wrong san ipv6");
++        ok(0,verifyconfcert(certsimple, &conf, &hp),"negative san ipv6");
++        ok(1,verifyconfcert(certsanipv6indns, &conf, &hp),"san ipv6 in dns");
++        ok(1,verifyconfcert(certcomplex,&conf, &hp),"san ipv6 in complex cert");
+ 
+         freeaddrinfo(hp.addrinfo);
+         while(list_shift(conf.hostports));
+@@ -326,10 +326,10 @@ vY/uPjA=\n\
+         hp.prefixlen = 255;
+         list_push(conf.hostports, &hp);
+ 
+-        ok(1,verifyconfcert(certsandns, &conf),"san dns");
+-        ok(0,verifyconfcert(certsandnsother, &conf),"negative san dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"san dns in complex cert");
+-        ok(0,verifyconfcert(certsimple, &conf),"missing san dns");
++        ok(1,verifyconfcert(certsandns, &conf, &hp),"san dns");
++        ok(0,verifyconfcert(certsandnsother, &conf, &hp),"negative san dns");
++        ok(1,verifyconfcert(certcomplex,&conf, &hp),"san dns in complex cert");
++        ok(0,verifyconfcert(certsimple, &conf, &hp),"missing san dns");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -347,8 +347,8 @@ vY/uPjA=\n\
+         hp2.prefixlen = 255;
+         list_push(conf.hostports, &hp2);
+ 
+-        ok(1,verifyconfcert(certsimple, &conf),"multi hostport cn");
+-        ok(0,verifyconfcert(certsimpleother, &conf),"negative multi hostport cn");
++        ok(1,verifyconfcert(certsimple, &conf, NULL),"multi hostport cn");
++        ok(0,verifyconfcert(certsimpleother, &conf, NULL),"negative multi hostport cn");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -366,9 +366,14 @@ vY/uPjA=\n\
+         hp2.prefixlen = 255;
+         list_push(conf.hostports, &hp2);
+ 
+-        ok(1,verifyconfcert(certsandns, &conf),"multi hostport san dns");
+-        ok(0,verifyconfcert(certsandnsother, &conf),"negative multi hostport san dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"multi hostport san dns in complex cert");
++        ok(1,verifyconfcert(certsandns, &conf, NULL),"multi hostport san dns");
++        ok(0,verifyconfcert(certsandnsother, &conf, NULL),"negative multi hostport san dns");
++        ok(1,verifyconfcert(certcomplex,&conf, NULL),"multi hostport san dns in complex cert");
++
++        ok(0,verifyconfcert(certsandns, &conf, &hp1),"multi hostport explicit wrong cert");
++        ok(1,verifyconfcert(certsandns, &conf, &hp2),"multi hostport explicit matching cert");
++        ok(0,verifyconfcert(certcomplex, &conf, &hp1),"multi hostport explicit wrong complex cert");
++        ok(1,verifyconfcert(certcomplex, &conf, &hp2),"multi hostport explicit matching complex cert");
+ 
+         while(list_shift(conf.hostports));
+     }
+@@ -380,9 +385,9 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "CN:/t..t/"),"explicit cn regex config");
+ 
+-        ok(1,verifyconfcert(certsimple, &conf),"explicit cn regex");
+-        ok(0,verifyconfcert(certsimpleother, &conf),"negative explicit cn regex");
+-        ok(1,verifyconfcert(certsandns, &conf), "explicit cn regex with SAN DNS");
++        ok(1,verifyconfcert(certsimple, &conf, NULL),"explicit cn regex");
++        ok(0,verifyconfcert(certsimpleother, &conf, NULL),"negative explicit cn regex");
++        ok(1,verifyconfcert(certsandns, &conf, NULL), "explicit cn regex with SAN DNS");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -394,10 +399,10 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:IP:192.0.2.1"),"explicit san ip config");
+ 
+-        ok(1,verifyconfcert(certsanip, &conf),"explicit san ip");
+-        ok(0,verifyconfcert(certsanipother, &conf),"wrong explicit san ip");
+-        ok(0,verifyconfcert(certsimple, &conf), "missing explicit san ip");
+-        ok(1,verifyconfcert(certcomplex,&conf),"explicit san ip in complex cert");
++        ok(1,verifyconfcert(certsanip, &conf, NULL),"explicit san ip");
++        ok(0,verifyconfcert(certsanipother, &conf, NULL),"wrong explicit san ip");
++        ok(0,verifyconfcert(certsimple, &conf, NULL), "missing explicit san ip");
++        ok(1,verifyconfcert(certcomplex,&conf, NULL),"explicit san ip in complex cert");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -409,10 +414,10 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:IP:2001:db8::1"),"explicit san ipv6 config");
+ 
+-        ok(1,verifyconfcert(certsanipv6, &conf),"explicit san ipv6");
+-        ok(0,verifyconfcert(certsanipother, &conf),"wrong explicit san ipv6");
+-        ok(0,verifyconfcert(certsimple, &conf),"missing explicitsan ipv6");
+-        ok(1,verifyconfcert(certcomplex,&conf),"explicit san ipv6 in complex cert");
++        ok(1,verifyconfcert(certsanipv6, &conf, NULL),"explicit san ipv6");
++        ok(0,verifyconfcert(certsanipother, &conf, NULL),"wrong explicit san ipv6");
++        ok(0,verifyconfcert(certsimple, &conf, NULL),"missing explicitsan ipv6");
++        ok(1,verifyconfcert(certcomplex,&conf, NULL),"explicit san ipv6 in complex cert");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -424,10 +429,10 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:DNS:/t..t\\.local/"),"explicit san dns regex config");
+ 
+-        ok(1,verifyconfcert(certsandns, &conf),"explicit san dns");
+-        ok(0,verifyconfcert(certsandnsother, &conf),"negative explicit san dns");
+-        ok(0,verifyconfcert(certsimple,&conf),"missing explicit san dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"explicit san dns in complex cert");
++        ok(1,verifyconfcert(certsandns, &conf, NULL),"explicit san dns");
++        ok(0,verifyconfcert(certsandnsother, &conf, NULL),"negative explicit san dns");
++        ok(0,verifyconfcert(certsimple,&conf, NULL),"missing explicit san dns");
++        ok(1,verifyconfcert(certcomplex,&conf, NULL),"explicit san dns in complex cert");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -439,9 +444,9 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:URI:/https:\\/\\/test.local\\/profile#me/"),"explicit cn regex config");
+ 
+-        ok(1,verifyconfcert(certsanuri, &conf),"explicit san uri regex");
+-        ok(0,verifyconfcert(certsanuriother, &conf),"negative explicit san uri");
+-        ok(0,verifyconfcert(certsimple, &conf), "missing explicit san uri");
++        ok(1,verifyconfcert(certsanuri, &conf, NULL),"explicit san uri regex");
++        ok(0,verifyconfcert(certsanuriother, &conf, NULL),"negative explicit san uri");
++        ok(0,verifyconfcert(certsimple, &conf, NULL), "missing explicit san uri");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -453,9 +458,9 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:rID:1.2.3.4"),"explicit san rid config");
+ 
+-        ok(1,verifyconfcert(certsanrid, &conf),"explicit san rid");
+-        ok(0,verifyconfcert(certsanridother, &conf),"negative explicit san rid");
+-        ok(0,verifyconfcert(certsimple, &conf), "missing explicit san rid");
++        ok(1,verifyconfcert(certsanrid, &conf, NULL),"explicit san rid");
++        ok(0,verifyconfcert(certsanridother, &conf, NULL),"negative explicit san rid");
++        ok(0,verifyconfcert(certsimple, &conf, NULL), "missing explicit san rid");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -467,9 +472,9 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:otherName:1.3.6.1.5.5.7.8.8:/test.local/"),"explicit san otherName config");
+ 
+-        ok(1,verifyconfcert(certsanothername, &conf),"explicit san otherName");
+-        ok(0,verifyconfcert(certsanothernameother, &conf),"negative explicit san otherName");
+-        ok(0,verifyconfcert(certsimple, &conf), "missing explicit san otherName");
++        ok(1,verifyconfcert(certsanothername, &conf, NULL),"explicit san otherName");
++        ok(0,verifyconfcert(certsanothernameother, &conf, NULL),"negative explicit san otherName");
++        ok(0,verifyconfcert(certsimple, &conf, NULL), "missing explicit san otherName");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -480,7 +485,7 @@ vY/uPjA=\n\
+         conf.certnamecheck = 0;
+ 
+         ok(1,addmatchcertattr(&conf, "CN:/t..t"),"test regex config syntax");
+-        ok(1,verifyconfcert(certsimple, &conf),"test regex config syntax execution");
++        ok(1,verifyconfcert(certsimple, &conf, NULL),"test regex config syntax execution");
+ 
+         freematchcertattr(&conf);
+     }
+@@ -518,10 +523,10 @@ vY/uPjA=\n\
+ 
+         ok(1,addmatchcertattr(&conf, "CN:/t..t"),"combined config");
+ 
+-        ok(1,verifyconfcert(certsandns, &conf),"combined san dns");
+-        ok(0,verifyconfcert(certsandnsother, &conf),"negative combined san dns");
+-        ok(1,verifyconfcert(certcomplex,&conf),"combined san dns in complex cert");
+-        ok(0,verifyconfcert(certsimple, &conf),"combined missing san dns");
++        ok(1,verifyconfcert(certsandns, &conf, &hp),"combined san dns");
++        ok(0,verifyconfcert(certsandnsother, &conf, &hp),"negative combined san dns");
++        ok(1,verifyconfcert(certcomplex,&conf, &hp),"combined san dns in complex cert");
++        ok(0,verifyconfcert(certsimple, &conf, &hp),"combined missing san dns");
+ 
+         while(list_shift(conf.hostports));
+         freematchcertattr(&conf);
+@@ -540,12 +545,12 @@ vY/uPjA=\n\
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:DNS:/test\\.local/"),"multiple check 1");
+         ok(1,addmatchcertattr(&conf, "SubjectAltName:rID:1.2.3.4"),"multiple check 2");
+ 
+-        ok(0,verifyconfcert(certsandns, &conf),"multiple missing rID");
+-        ok(0,verifyconfcert(certsanrid, &conf), "multiple missing DNS");
+-        ok(1,verifyconfcert(certmulti, &conf),"multiple SANs");
+-        ok(0,verifyconfcert(certmultiother, &conf),"multiple negative match");
+-        ok(0,verifyconfcert(certcomplex, &conf),"multiple missing rID in complex cert");
+-        ok(0,verifyconfcert(certsimple, &conf),"multiple missing everything");
++        ok(0,verifyconfcert(certsandns, &conf, &hp),"multiple missing rID");
++        ok(0,verifyconfcert(certsanrid, &conf, &hp), "multiple missing DNS");
++        ok(1,verifyconfcert(certmulti, &conf, &hp),"multiple SANs");
++        ok(0,verifyconfcert(certmultiother, &conf, &hp),"multiple negative match");
++        ok(0,verifyconfcert(certcomplex, &conf, &hp),"multiple missing rID in complex cert");
++        ok(0,verifyconfcert(certsimple, &conf, &hp),"multiple missing everything");
+ 
+         while(list_shift(conf.hostports));
+         freematchcertattr(&conf);
+diff --git a/tls.c b/tls.c
+index 87bbe2c..049f3a9 100644
+--- a/tls.c
++++ b/tls.c
+@@ -23,11 +23,11 @@
+ #include <assert.h>
+ #include "radsecproxy.h"
+ #include "hostport.h"
+-
+-#ifdef RADPROT_TLS
+ #include "debug.h"
+ #include "util.h"
+ 
++#ifdef RADPROT_TLS
++
+ static void setprotoopts(struct commonprotoopts *opts);
+ static char **getlistenerargs();
+ void *tlslistener(void *arg);
+@@ -82,6 +82,17 @@ void tlssetsrcres() {
+                                    AF_UNSPEC, NULL, protodefs.socktype);
+ }
+ 
++static void cleanup_connection(struct server *server) {
++    if (server->ssl)
++        SSL_shutdown(server->ssl);
++    if (server->sock >= 0)
++        close(server->sock);
++    server->sock = -1;
++    if (server->ssl)
++        SSL_free(server->ssl);
++    server->ssl = NULL;
++}
++
+ int tlsconnect(struct server *server, int timeout, char *text) {
+     struct timeval now, start;
+     time_t wait;
+@@ -92,6 +103,8 @@ int tlsconnect(struct server *server, int timeout, char *text) {
+     int origflags;
+     struct addrinfo *source = NULL;
+     char *subj;
++    struct list_node *entry;
++    struct hostportres *hp;
+ 
+     debug(DBG_DBG, "tlsconnect: called from %s", text);
+     pthread_mutex_lock(&server->lock);
+@@ -108,15 +121,7 @@ int tlsconnect(struct server *server, int timeout, char *text) {
+     gettimeofday(&start, NULL);
+ 
+     for (;;) {
+-        /* ensure previous connection is properly closed */
+-        if (server->ssl)
+-            SSL_shutdown(server->ssl);
+-        if (server->sock >= 0)
+-            close(server->sock);
+-        if (server->ssl)
+-            SSL_free(server->ssl);
+-        server->ssl = NULL;
+-
++        cleanup_connection(server);
+         wait = connect_wait(start, server->connecttime, firsttry);
+         gettimeofday(&now, NULL);
+         if (timeout && (now.tv_sec - start.tv_sec) + wait > timeout) {
+@@ -124,7 +129,7 @@ int tlsconnect(struct server *server, int timeout, char *text) {
+             if (source) freeaddrinfo(source);
+             return 0;
+         }
+-        debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
++        if (wait) debug(DBG_INFO, "Next connection attempt to %s in %lds", server->conf->name, wait);
+         sleep(wait);
+         firsttry = 0;
+ 
+@@ -135,46 +140,76 @@ int tlsconnect(struct server *server, int timeout, char *text) {
+             return 0;
+         }
+ 
+-        debug(DBG_INFO, "tlsconnect: connecting to %s", server->conf->name);
+-        if ((server->sock = connecttcphostlist(server->conf->hostports, source ? source : srcres)) < 0)
+-            continue;
+-        if (server->conf->keepalive)
+-            enable_keepalive(server->sock);
++        for (entry = list_first(server->conf->hostports); entry; entry = list_next(entry)) {
++            hp = (struct hostportres *)entry->data;
++            debug(DBG_INFO, "tlsconnect: trying to open TLS connection to server %s (%s port %s)", server->conf->name, hp->host, hp->port);
++            if ((server->sock = connecttcp(hp->addrinfo, source ? source : srcres, list_count(server->conf->hostports) > 1 ? 5 : 30)) < 0 ) {
++                debug(DBG_ERR, "tlsconnect: TLS connection to %s (%s port %s) failed: TCP connect failed", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
++
++            if (server->conf->keepalive)
++                enable_keepalive(server->sock);
++
++            pthread_mutex_lock(&server->conf->tlsconf->lock);
++            if (!(ctx = tlsgetctx(handle, server->conf->tlsconf))) {
++                pthread_mutex_unlock(&server->conf->tlsconf->lock);
++                debug(DBG_ERR, "tlsconnect: failed to get TLS context for server %s", server->conf->name);
++                goto concleanup;
++            }
+ 
+-        pthread_mutex_lock(&server->conf->tlsconf->lock);
+-        if (!(ctx = tlsgetctx(handle, server->conf->tlsconf))){
++            server->ssl = SSL_new(ctx);
+             pthread_mutex_unlock(&server->conf->tlsconf->lock);
+-            continue;
+-        }
++            if (!server->ssl) {
++                debug(DBG_ERR, "tlsconnect: failed to create SSL conneciton for server %s", server->conf->name);
++                goto concleanup;
++            }
+ 
+-        server->ssl = SSL_new(ctx);
+-        pthread_mutex_unlock(&server->conf->tlsconf->lock);
+-        if (!server->ssl)
+-            continue;
++            if (server->conf->sni) {
++                struct in6_addr tmp;
++                char *servername = server->conf->sniservername ? server->conf->sniservername : 
++                    (inet_pton(AF_INET, hp->host, &tmp) || inet_pton(AF_INET6, hp->host, &tmp)) ? NULL : hp->host;
++                if (servername && !tlssetsni(server->ssl, servername)) {
++                    debug(DBG_ERR, "tlsconnect: set SNI %s failed", servername);
++                    goto concleanup;
++                }
++            }
++            
++            SSL_set_fd(server->ssl, server->sock);
++            if (sslconnecttimeout(server->ssl, 5) <= 0) {
++                while ((error = ERR_get_error()))
++                    debug(DBG_ERR, "tlsconnect: SSL connect to %s failed: %s", server->conf->name, ERR_error_string(error, NULL));
++                debug(DBG_ERR, "tlsconnect: SSL connect to %s (%s port %s) failed", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
+ 
+-        SSL_set_fd(server->ssl, server->sock);
+-        if (sslconnecttimeout(server->ssl, 5) <= 0) {
+-            while ((error = ERR_get_error()))
+-                debug(DBG_ERR, "tlsconnect: SSL connect to %s failed: %s", server->conf->name, ERR_error_string(error, NULL));
+-            debug(DBG_ERR, "tlsconnect: SSL connect to %s failed", server->conf->name);
+-            continue;
+-        }
++            cert = verifytlscert(server->ssl);
++            if (!cert) {
++                debug(DBG_ERR, "tlsconnect: certificate verification failed for %s (%s port %s)", server->conf->name, hp->host, hp->port);
++                goto concleanup;
++            }
+ 
+-        cert = verifytlscert(server->ssl);
+-        if (!cert)
+-            continue;
+-        if (verifyconfcert(cert, server->conf)) {
+-            subj = getcertsubject(cert);
+-            if(subj) {
+-                debug(DBG_WARN, "tlsconnect: TLS connection to %s, subject %s up", server->conf->name, subj);
+-                free(subj);
++            if (verifyconfcert(cert, server->conf, hp)) {
++                subj = getcertsubject(cert);
++                if(subj) {
++                    debug(DBG_WARN, "tlsconnect: TLS connection to %s (%s port %s), subject %s, %s with cipher %s up",
++                        server->conf->name, hp->host, hp->port, subj,
++                        SSL_get_version(server->ssl), SSL_CIPHER_get_name(SSL_get_current_cipher(server->ssl)));
++                    free(subj);
++                }
++                X509_free(cert);
++                break;
++            } else {
++                debug(DBG_ERR, "tlsconnect: certificate verification failed for %s (%s port %s)", server->conf->name, hp->host, hp->port);
+             }
+             X509_free(cert);
+-            break;
++
++concleanup:
++            /* ensure previous connection is properly closed */
++            cleanup_connection(server);
+         }
+-        X509_free(cert);
++        if (server->ssl) break;
+     }
+-    debug(DBG_WARN, "tlsconnect: TLS connection to %s up", server->conf->name);
+ 
+     origflags = fcntl(server->sock, F_GETFL, 0);
+     if (origflags == -1) {
+@@ -251,6 +286,7 @@ int sslreadtimeout(SSL *ssl, unsigned char *buf, int num, int timeout, pthread_m
+                     continue;
+                 case SSL_ERROR_ZERO_RETURN:
+                     debug(DBG_DBG, "sslreadtimeout: got ssl shutdown");
++                    /* fallthrough */
+                 default:
+                     while ((error = ERR_get_error()))
+                         debug(DBG_ERR, "sslreadtimeout: SSL: %s", ERR_error_string(error, NULL));
+@@ -505,6 +541,7 @@ void *tlsservernew(void *arg) {
+     struct client *client;
+     struct tls *accepted_tls = NULL;
+     char tmp[INET6_ADDRSTRLEN], *subj;
++    struct hostportres *hp;
+ 
+     s = *(int *)arg;
+     free(arg);
+@@ -514,7 +551,7 @@ void *tlsservernew(void *arg) {
+     }
+     debug(DBG_WARN, "tlsservernew: incoming TLS connection from %s", addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));
+ 
+-    conf = find_clconf(handle, (struct sockaddr *)&from, &cur);
++    conf = find_clconf(handle, (struct sockaddr *)&from, &cur, &hp);
+     if (conf) {
+         pthread_mutex_lock(&conf->tlsconf->lock);
+         ctx = tlsgetctx(handle, conf->tlsconf);
+@@ -549,11 +586,12 @@ void *tlsservernew(void *arg) {
+     }
+ 
+     while (conf) {
+-        if (accepted_tls == conf->tlsconf && verifyconfcert(cert, conf)) {
++        if (accepted_tls == conf->tlsconf && verifyconfcert(cert, conf, NULL)) {
+             subj = getcertsubject(cert);
+             if(subj) {
+-                debug(DBG_WARN, "tlsservernew: TLS connection from %s, client %s, subject %s up",
+-                    addr2string((struct sockaddr *)&from,tmp, sizeof(tmp)), conf->name, subj);
++                debug(DBG_WARN, "tlsservernew: TLS connection from %s, client %s, subject %s, %s with cipher %s up",
++                    addr2string((struct sockaddr *)&from,tmp, sizeof(tmp)), conf->name, subj,
++                    SSL_get_version(ssl), SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+                 free(subj);
+             }
+             X509_free(cert);
+@@ -569,9 +607,10 @@ void *tlsservernew(void *arg) {
+                 debug(DBG_WARN, "tlsservernew: failed to create new client instance");
+             goto exit;
+         }
+-        conf = find_clconf(handle, (struct sockaddr *)&from, &cur);
++        conf = find_clconf(handle, (struct sockaddr *)&from, &cur, &hp);
+     }
+-    debug(DBG_WARN, "tlsservernew: ignoring request, no matching TLS client");
++    debug(DBG_WARN, "tlsservernew: ignoring request, no matching TLS client for %s", 
++        addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));
+     if (cert)
+ 	X509_free(cert);
+ 
+diff --git a/tlscommon.c b/tlscommon.c
+index 0bd7da4..2dc0f48 100644
+--- a/tlscommon.c
++++ b/tlscommon.c
+@@ -492,12 +492,26 @@ static SSL_CTX *tlscreatectx(uint8_t type, struct tls *conf) {
+ #endif
+ 
+     if (conf->dhparam) {
++#if OPENSSL_VERSION_NUMBER >= 0x30000000
++        if (!SSL_CTX_set0_tmp_dh_pkey(ctx, conf->dhparam)) {
++#else
+         if (!SSL_CTX_set_tmp_dh(ctx, conf->dhparam)) {
++#endif
+             while ((error = ERR_get_error()))
+                 debug(DBG_WARN, "tlscreatectx: SSL: %s", ERR_error_string(error, NULL));
+             debug(DBG_WARN, "tlscreatectx: Failed to set dh params. Can continue, but some ciphers might not be available.");
+         }
+     }
++#if OPENSSL_VERSION_NUMBER >= 0x10100000
++    else {
++        if (!SSL_CTX_set_dh_auto(ctx, 1)) {
++            while ((error = ERR_get_error()))
++                debug(DBG_WARN, "tlscreatectx: SSL: %s", ERR_error_string(error, NULL));
++            debug(DBG_WARN, "tlscreatectx: Failed to set automatic dh params. Can continue, but some ciphers might not be available.");
++        }
++    }
++#endif
++
+     debug(DBG_DBG, "tlscreatectx: created TLS context %s", conf->name);
+     return ctx;
+ }
+@@ -506,7 +520,7 @@ struct tls *tlsgettls(char *alt1, char *alt2) {
+     struct tls *t;
+ 
+     t = hash_read(tlsconfs, alt1, strlen(alt1));
+-    if (!t)
++    if (!t && alt2)
+ 	t = hash_read(tlsconfs, alt2, strlen(alt2));
+     return t;
+ }
+@@ -711,64 +725,67 @@ static int matchsubjaltname(X509 *cert, struct certattrmatch* match) {
+     }
+ 
+     if (r<1)
+-        debug(DBG_WARN, "matchsubjaltname: no matching Subject Alt Name found! (%s)", fail);
++        debug(DBG_DBG, "matchsubjaltname: no matching Subject Alt Name found! (%s)", fail);
+     free(fail);
+ 
+     GENERAL_NAMES_free(alt);
+     return r;
+ }
+ 
+-int certnamecheck(X509 *cert, struct list *hostports) {
+-    struct list_node *entry;
+-    struct hostportres *hp;
++int certnamecheck(X509 *cert, struct hostportres *hp) {
+     int r = 0;
+     struct certattrmatch match;
+ 
+     memset(&match, 0, sizeof(struct certattrmatch));
+ 
+-    for (entry = list_first(hostports); entry; entry = list_next(entry)) {
+-        r = 0;
+-        hp = (struct hostportres *)entry->data;
+-        if (hp->prefixlen != 255) {
+-            /* we disable the check for prefixes */
++    r = 0;
++    if (hp->prefixlen != 255) {
++        /* we disable the check for prefixes */
++        return 1;
++    }
++    if (inet_pton(AF_INET, hp->host, &match.ipaddr))
++        match.af = AF_INET;
++    else if (inet_pton(AF_INET6, hp->host, &match.ipaddr))
++        match.af = AF_INET6;
++    else
++        match.af = 0;
++    match.exact = hp->host;
++
++    if (match.af) {
++        match.matchfn = &certattr_matchip;
++        match.type = GEN_IPADD;
++        r = matchsubjaltname(cert, &match);
++    }
++    if (!r) {
++        match.matchfn = &certattr_matchregex;
++        match.type = GEN_DNS;
++        r = matchsubjaltname(cert, &match);
++    }
++    if (r) {
++        if (r > 0) {
++            debug(DBG_DBG, "certnamecheck: Found subjectaltname matching %s %s", match.af ? "address" : "host", hp->host);
+             return 1;
+         }
+-        if (inet_pton(AF_INET, hp->host, &match.ipaddr))
+-            match.af = AF_INET;
+-        else if (inet_pton(AF_INET6, hp->host, &match.ipaddr))
+-            match.af = AF_INET6;
+-        else
+-            match.af = 0;
+-        match.exact = hp->host;
+-
+-        if (match.af) {
+-            match.matchfn = &certattr_matchip;
+-            match.type = GEN_IPADD;
+-            r = matchsubjaltname(cert, &match);
+-        }
+-        if (!r) {
+-            match.matchfn = &certattr_matchregex;
+-            match.type = GEN_DNS;
+-            r = matchsubjaltname(cert, &match);
+-        }
+-        if (r) {
+-            if (r > 0) {
+-                debug(DBG_DBG, "certnamecheck: Found subjectaltname matching %s %s", match.af ? "address" : "host", hp->host);
+-                return 1;
+-            }
+-            debug(DBG_WARN, "certnamecheck: No subjectaltname matching %s %s", match.af ? "address" : "host", hp->host);
+-        } else {
+-            if (certattr_matchcn(cert, &match)) {
+-                debug(DBG_DBG, "certnamecheck: Found cn matching host %s", hp->host);
+-                return 1;
+-            }
+-            debug(DBG_WARN, "certnamecheck: cn not matching host %s", hp->host);
++        debug(DBG_WARN, "certnamecheck: No subjectaltname matching %s %s", match.af ? "address" : "host", hp->host);
++    } else { /* as per RFC 6125 6.4.4: CN MUST NOT be matched if SAN is present */
++        if (certattr_matchcn(cert, &match)) {
++            debug(DBG_DBG, "certnamecheck: Found cn matching host %s", hp->host);
++            return 1;
+         }
++        debug(DBG_WARN, "certnamecheck: cn not matching host %s", hp->host);
+     }
+     return 0;
+ }
+ 
+-int verifyconfcert(X509 *cert, struct clsrvconf *conf) {
++int certnamecheckany(X509 *cert, struct list *hostports) {
++    struct list_node *entry;
++    for (entry = list_first(hostports); entry; entry = list_next(entry)) {
++        if (certnamecheck(cert, (struct hostportres *)entry->data)) return 1;
++    }
++    return 0;
++}
++
++int verifyconfcert(X509 *cert, struct clsrvconf *conf, struct hostportres *hpconnected) {
+     char *subject;
+     int ok = 1;
+     struct list_node *entry;
+@@ -777,9 +794,16 @@ int verifyconfcert(X509 *cert, struct clsrvconf *conf) {
+     debug(DBG_DBG, "verifyconfcert: verify certificate for host %s, subject %s", conf->name, subject);
+     if (conf->certnamecheck) {
+         debug(DBG_DBG, "verifyconfcert: verify hostname");
+-        if (!certnamecheck(cert, conf->hostports)) {
+-            debug(DBG_DBG, "verifyconfcert: certificate name check failed for host %s", conf->name);
+-            ok = 0;
++        if (hpconnected) {
++            if (!certnamecheck(cert, hpconnected)) {
++                debug(DBG_WARN, "verifyconfcert: certificate name check failed for host %s (%s)", conf->name, hpconnected->host);
++                ok = 0;
++            }
++        } else {
++            if (!certnamecheckany(cert, conf->hostports)) {
++                debug(DBG_DBG, "verifyconfcert: no matching CN or SAN found for host %s", conf->name);
++                ok = 0;
++            }
+         }
+     }
+ 
+@@ -913,11 +937,27 @@ int conftls_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *v
+         dtlsversion = NULL;
+     }
+ #else
++    if (tlsversion || dtlsversion) {
+         debug(DBG_ERR, "error in block %s, setting tls/dtls version requires openssl 1.1.0 or later", val);
+         goto errexit;
++    }
+ #endif
+ 
+     if (dhfile) {
++#if OPENSSL_VERSION_NUMBER >= 0x30000000
++        BIO *bio = BIO_new_file(dhfile, "r");
++        if (bio) {
++            conf->dhparam = EVP_PKEY_new();
++            if (!PEM_read_bio_Parameters(bio, &conf->dhparam)) {
++                BIO_free(bio);
++                while ((error = ERR_get_error()))
++                    debug(DBG_ERR, "SSL: %s", ERR_error_string(error, NULL));
++                debug(DBG_ERR, "error in block %s: Failed to load DhFile %s.", val, dhfile);
++                goto errexit;
++            }
++            BIO_free(bio);
++        }
++#else
+         FILE *dhfp = fopen(dhfile, "r");
+         if (dhfp) {
+             conf->dhparam = PEM_read_DHparams(dhfp, NULL, NULL, NULL);
+@@ -934,6 +974,7 @@ int conftls_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *v
+         }
+         free(dhfile);
+         dhfile = NULL;
++#endif
+     }
+ 
+     conf->name = stringcopy(val, 0);
+@@ -964,7 +1005,11 @@ errexit:
+     free(tlsversion);
+     free(dtlsversion);
+     free(dhfile);
++#if OPENSSL_VERSION_NUMBER >= 0x30000000
++    EVP_PKEY_free(conf->dhparam);
++#else
+     DH_free(conf->dhparam);
++#endif
+     free(conf);
+     return 0;
+ }
+@@ -1091,6 +1136,10 @@ void freematchcertattr(struct clsrvconf *conf) {
+     }
+ }
+ 
++int tlssetsni(SSL *ssl, char *sni) {
++    return SSL_set_tlsext_host_name(ssl, sni); 
++}
++
+ int sslaccepttimeout (SSL *ssl, int timeout) {
+     int socket, origflags, ndesc, r = -1, sockerr = 0;
+     socklen_t errlen = sizeof(sockerr);
+diff --git a/tlscommon.h b/tlscommon.h
+index 6be9079..1006626 100644
+--- a/tlscommon.h
++++ b/tlscommon.h
+@@ -3,6 +3,7 @@
+ /* See LICENSE for licensing information. */
+ 
+ #include <openssl/ssl.h>
++#include "hostport.h"
+ 
+ #if OPENSSL_VERSION_NUMBER < 0x10100000L
+ #define ASN1_STRING_get0_data(o) ((o)->data)
+@@ -25,7 +26,11 @@ struct tls {
+     int tlsmaxversion;
+     int dtlsminversion;
+     int dtlsmaxversion;
++#if OPENSSL_VERSION_NUMBER >= 0x30000000
++    EVP_PKEY* dhparam;
++#else
+     DH *dhparam;
++#endif
+     uint32_t tlsexpiry;
+     uint32_t dtlsexpiry;
+     X509_VERIFY_PARAM *vpm;
+@@ -40,12 +45,13 @@ void sslinit();
+ struct tls *tlsgettls(char *alt1, char *alt2);
+ SSL_CTX *tlsgetctx(uint8_t type, struct tls *t);
+ X509 *verifytlscert(SSL *ssl);
+-int verifyconfcert(X509 *cert, struct clsrvconf *conf);
++int verifyconfcert(X509 *cert, struct clsrvconf *conf, struct hostportres *);
+ char *getcertsubject(X509 *cert);
+ int conftls_cb(struct gconffile **cf, void *arg, char *block, char *opt, char *val);
+ int addmatchcertattr(struct clsrvconf *conf, const char *match);
+ void freematchcertattr(struct clsrvconf *conf);
+ void tlsreloadcrls();
++int tlssetsni(SSL *ssl, char *sni);
+ int sslconnecttimeout(SSL *ssl, int timeout);
+ int sslaccepttimeout (SSL *ssl, int timeout);
+ #endif
+diff --git a/tlv11.c b/tlv11.c
+index d570b39..9eaf6d9 100644
+--- a/tlv11.c
++++ b/tlv11.c
+@@ -12,6 +12,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <arpa/inet.h>
++#include <stdio.h>
+ 
+ struct tlv *maketlv(uint8_t t, uint8_t l, void *v) {
+     struct tlv *tlv;
+@@ -97,6 +98,8 @@ void rmtlv(struct list *tlvs, uint8_t t) {
+ }
+ 
+ uint8_t *tlv2str(struct tlv *tlv) {
++    if(!tlv)
++        return NULL;
+     uint8_t *s = malloc(tlv->l + 1);
+     if (s) {
+ 	memcpy(s, tlv->v, tlv->l);
+@@ -117,6 +120,28 @@ struct tlv *resizetlv(struct tlv *tlv, uint8_t newlen) {
+     return tlv;
+ }
+ 
++uint32_t tlv2longint(struct tlv *tlv) {
++    if (!tlv) return 0;
++    if (tlv->l != sizeof(uint32_t)) return 0;
++    return ntohl(*(uint32_t *)tlv->v);
++}
++
++char* tlv2ipv4addr(struct tlv *tlv) {
++    char *result;
++
++    if (!tlv) return NULL;
++    if (tlv->l != sizeof(in_addr_t)) return NULL;
++
++    result = malloc(INET_ADDRSTRLEN);
++    if (!result) return NULL;
++
++    if (!inet_ntop(AF_INET, tlv->v, result, INET_ADDRSTRLEN)) {
++        free(result);
++        return NULL;
++    }
++    return result;
++}
++
+ /* Local Variables: */
+ /* c-file-style: "stroustrup" */
+ /* End: */
+diff --git a/tlv11.h b/tlv11.h
+index 84db3d7..c565d13 100644
+--- a/tlv11.h
++++ b/tlv11.h
+@@ -17,6 +17,8 @@ void freetlvlist(struct list *);
+ void rmtlv(struct list *, uint8_t);
+ uint8_t *tlv2str(struct tlv *tlv);
+ struct tlv *resizetlv(struct tlv *, uint8_t);
++uint32_t tlv2longint(struct tlv *tlv);
++char* tlv2ipv4addr(struct tlv *tlv);
+ 
+ /* Local Variables: */
+ /* c-file-style: "stroustrup" */
+diff --git a/tools/naptr-eduroam.sh b/tools/naptr-eduroam.sh
+index 5402d18..2f90601 100755
+--- a/tools/naptr-eduroam.sh
++++ b/tools/naptr-eduroam.sh
+@@ -14,7 +14,6 @@ usage() {
+ 
+ test -n "${1}" || usage
+ 
+-REALM="${1}"
+ DIGCMD=$(command -v dig)
+ HOSTCMD=$(command -v host)
+ PRINTCMD=$(command -v printf)
+@@ -38,7 +37,7 @@ dig_it_srv() {
+ }
+ 
+ dig_it_naptr() {
+-    ${DIGCMD} +short naptr ${REALM} | grep x-eduroam:radius.tls | sort -n -k1 |
++    ${DIGCMD} +short naptr "${REALM}" | grep x-eduroam:radius.tls | sort -n -k1 |
+     while read line; do
+         set $line ; TYPE=$3 ; HOST=$(validate_host $6)
+         if ( [ "$TYPE" = "\"s\"" ] || [ "$TYPE" = "\"S\"" ] ) && [ -n "${HOST}" ]; then
+@@ -59,7 +58,7 @@ host_it_srv() {
+ }
+ 
+ host_it_naptr() {
+-    ${HOSTCMD} -t naptr ${REALM} | grep x-eduroam:radius.tls | sort -n -k5 |
++    ${HOSTCMD} -t naptr "${REALM}" | grep x-eduroam:radius.tls | sort -n -k5 |
+     while read line; do
+         set $line ; TYPE=$7 ; HOST=$(validate_host ${10})
+         if ( [ "$TYPE" = "\"s\"" ] || [ "$TYPE" = "\"S\"" ] ) && [ -n "${HOST}" ]; then
+@@ -69,6 +68,12 @@ host_it_naptr() {
+     done
+ }
+ 
++REALM=$(validate_host ${1})
++if [ -z "${REALM}" ]; then
++    echo "Error: realm \"${1}\" failed validation"
++    usage
++fi
++
+ if [ -x "${DIGCMD}" ]; then
+     SERVERS=$(dig_it_naptr)
+ elif [ -x "${HOSTCMD}" ]; then
+@@ -79,7 +84,7 @@ else
+ fi
+ 
+ if [ -n "${SERVERS}" ]; then
+-    $PRINTCMD "server dynamic_radsec.${REALM} {\n${SERVERS}\n\ttype TLS\n}\n"
++    $PRINTCMD "server dynamic_radsec.${REALM} {\n${SERVERS}\n}\n"
+     exit 0
+ fi
+ 
+diff --git a/tools/radsec-dynsrv.sh b/tools/radsec-dynsrv.sh
+index 68bb5ba..d8318ed 100755
+--- a/tools/radsec-dynsrv.sh
++++ b/tools/radsec-dynsrv.sh
+@@ -14,7 +14,6 @@ usage() {
+ 
+ test -n "${1}" || usage
+ 
+-REALM="${1}"
+ DIGCMD=$(command -v digaaa)
+ HOSTCMD=$(command -v host)
+ PRINTCMD=$(command -v printf)
+@@ -28,7 +27,7 @@ validate_port() {
+ }
+ 
+ dig_it() {
+-   ${DIGCMD} +short srv _radsec._tcp.${REALM} | sort -n -k1 |
++   ${DIGCMD} +short srv "_radsec._tcp.${REALM}" | sort -n -k1 |
+    while read line ; do
+       set $line ; PORT=$(validate_port $3) ; HOST=$(validate_host $4)
+       if [ -n "${HOST}" ] && [ -n "${PORT}" ]; then 
+@@ -38,7 +37,7 @@ dig_it() {
+ }
+ 
+ host_it() {
+-   ${HOSTCMD} -t srv _radsec._tcp.${REALM} | sort -n -k5 |
++   ${HOSTCMD} -t srv "_radsec._tcp.${REALM}" | sort -n -k5 |
+    while read line ; do
+       set $line ; PORT=$(validate_port $7) ; HOST=$(validate_host $8) 
+       if [ -n "${HOST}" ] && [ -n "${PORT}" ]; then
+@@ -47,6 +46,12 @@ host_it() {
+    done
+ }
+ 
++REALM=$(validate_host ${1})
++if test -z "${REALM}" ; then
++    echo "Error: realm \"${1}\" failed validation"
++    usage
++fi
++
+ if test -x "${DIGCMD}" ; then
+    SERVERS=$(dig_it)
+ elif test -x "${HOSTCMD}" ; then
+@@ -57,7 +62,7 @@ else
+ fi
+ 
+ if test -n "${SERVERS}" ; then
+-        $PRINTCMD "server dynamic_radsec.${REALM} {\n${SERVERS}\n\ttype TLS\n}\n"
++        $PRINTCMD "server dynamic_radsec.${REALM} {\n${SERVERS}\n}\n"
+         exit 0
+ fi
+ 
+diff --git a/udp.c b/udp.c
+index e3e1464..6e86fbe 100644
+--- a/udp.c
++++ b/udp.c
+@@ -160,7 +160,7 @@ unsigned char *radudpget(int s, struct client **client, struct server **server)
+         }
+ 
+         p = client
+-            ? find_clconf(handle, (struct sockaddr *)&from, NULL)
++            ? find_clconf(handle, (struct sockaddr *)&from, NULL, NULL)
+             : find_srvconf(handle, (struct sockaddr *)&from, NULL);
+         if (!p) {
+             debug(DBG_WARN, "radudpget: got packet from wrong or unknown UDP peer %s, ignoring", addr2string((struct sockaddr *)&from, tmp, sizeof(tmp)));

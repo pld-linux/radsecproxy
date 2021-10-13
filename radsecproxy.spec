@@ -12,6 +12,7 @@ Source0:	https://github.com/radsecproxy/radsecproxy/releases/download/%{version}
 # Source0-md5:	4d4df9b333d4e901b7fefcddeabc9ce0
 Source1:	%{name}.init
 Source2:	%{name}.logrotate
+Patch0:		git.patch
 URL:		https://github.com/radsecproxy/radsecproxy
 BuildRequires:	autoconf >= 2.50
 BuildRequires:	automake
@@ -40,6 +41,7 @@ działania zużywa około 64 kB (w zależności od liczby partnerów).
 
 %prep
 %setup -q
+%patch0 -p1
 
 %{__rm} -r autom4te.cache
 
@@ -89,6 +91,6 @@ fi
 %attr(755,root,root) %{_bindir}/radsecproxy-conf
 %attr(755,root,root) %{_bindir}/radsecproxy-hash
 %attr(754,root,root) /etc/rc.d/init.d/%{name}
-%{_mandir}/man1/radsecproxy.1*
-%{_mandir}/man1/radsecproxy-hash.1*
 %{_mandir}/man5/radsecproxy.conf.5*
+%{_mandir}/man8/radsecproxy.8*
+%{_mandir}/man8/radsecproxy-hash.8*
